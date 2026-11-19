@@ -1,0 +1,4 @@
+node_modules/
+.pi/tasks/
+*.tsbuildinfo
+.DS_Store
