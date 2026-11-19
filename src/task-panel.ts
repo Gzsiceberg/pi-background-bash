@@ -4,6 +4,8 @@ import {
   matchesKey,
   truncateToWidth,
   type TUI,
+  type TuiMouseEvent,
+  type TuiMouseEventResult,
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
@@ -133,6 +135,7 @@ class TaskPanel implements Component {
   private previewRows = 12;
   private pathOffset?: number;
   private pathPage = { size: 1, lastStart: 0 };
+  private jobRowLayout: { startY: number; ids: string[] } = { startY: 0, ids: [] };
   private spinnerFrame = 0;
   private readonly timer: NodeJS.Timeout;
   private readonly tui: PanelTui;
@@ -271,16 +274,18 @@ class TaskPanel implements Component {
     const contentWidth = framed && innerWidth >= 6 ? innerWidth - 2 : innerWidth;
     const task = this.current();
     if (!task) {
+      this.jobRowLayout = { startY: 0, ids: [] };
       const title = this.theme.bold(this.theme.fg("toolTitle", "Background Tasks"));
       return frame(emptyPanel(rows, this.theme), width, framed, title, this.theme);
     }
     if (this.pathOffset !== undefined) {
+      this.jobRowLayout = { startY: 0, ids: [] };
       const title = this.pathTitle(task);
       const body = this.renderPath(task, rows, contentWidth, this.pathOffset, framed);
       return frame(body, width, framed, title, this.theme);
     }
     const title = this.jobsTitle(task);
-    const body = this.renderJob(task, rows, contentWidth);
+    const body = this.renderJob(task, rows, contentWidth, framed ? 1 : 0);
     return frame(body, width, framed, title, this.theme);
   }
 
@@ -362,14 +367,17 @@ class TaskPanel implements Component {
     return parts.join(this.theme.fg("dim", " · "));
   }
 
-  private jobRows(task: PanelTask, rows: number, width: number): BodyRow[] {
+  private jobRows(task: PanelTask, rows: number, width: number, startY: number): BodyRow[] {
     if (rows <= 1) {
+      this.jobRowLayout = { startY, ids: [] };
       return [];
     }
     const count = Math.min(this.tasks.length, MAX_JOB_ROWS, Math.max(1, Math.floor((rows - 4) / 2)));
     const index = this.tasks.indexOf(task);
     const first = Math.min(Math.max(0, index - Math.floor(count / 2)), this.tasks.length - count);
-    return this.tasks.slice(first, first + count).map((job) => {
+    const visible = this.tasks.slice(first, first + count);
+    this.jobRowLayout = { startY, ids: visible.map((job) => job.id) };
+    return visible.map((job) => {
       const selected = job === task;
       const pointer = selected ? this.theme.fg("accent", "›") : " ";
       const glyph = this.statusGlyph(job);
@@ -391,10 +399,10 @@ class TaskPanel implements Component {
     }
   }
 
-  private renderJob(task: PanelTask, rows: number, width: number): BodyRow[] {
+  private renderJob(task: PanelTask, rows: number, width: number, startY: number): BodyRow[] {
     const showDividers = rows >= 7;
     const footerRows = showDividers ? 2 : 1;
-    const body = this.jobRows(task, rows, width);
+    const body = this.jobRows(task, rows, width, startY);
     if (showDividers && body.length > 0) {
       body.push({ kind: "divider" });
     }
@@ -550,12 +558,87 @@ class TaskPanel implements Component {
       );
     } else if (matchesKey(data, "pageDown") && this.scrollBack !== undefined) {
       this.scrollBack = Math.max(0, this.scrollBack - this.previewRows);
+    } else if (matchesKey(data, "home") && this.loaded?.id === task.id && this.preview.lines.length) {
+      this.scrollBack = Math.max(0, this.preview.lines.length - this.previewRows);
     } else if (matchesKey(data, "end")) {
       this.scrollBack = undefined;
     } else {
       return this.switchJob(data, task);
     }
     return true;
+  }
+
+  handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+    if (this.disposed) {
+      return undefined;
+    }
+    if (event.type === "wheel") {
+      return this.handleWheel(Math.trunc(event.wheelDelta ?? 0));
+    }
+    if (event.type === "press" && event.button === "left") {
+      return this.handlePress(event.y);
+    }
+    return undefined;
+  }
+
+  private handleWheel(delta: number): TuiMouseEventResult {
+    if (delta === 0 || this.confirmId) {
+      return { handled: true, render: false };
+    }
+    if (this.pathOffset !== undefined) {
+      const current = Math.min(this.pathOffset, this.pathPage.lastStart);
+      const next = Math.max(0, Math.min(this.pathPage.lastStart, current + delta));
+      if (next === current) {
+        return { handled: true, render: false };
+      }
+      this.pathOffset = next;
+      return { handled: true };
+    }
+    return this.scrollPreview(delta);
+  }
+
+  private scrollPreview(delta: number): TuiMouseEventResult {
+    const task = this.current();
+    if (!task || this.loaded?.id !== task.id || !this.preview.lines.length) {
+      return { handled: true, render: false };
+    }
+    const maxBack = Math.max(0, this.preview.lines.length - this.previewRows);
+    if (delta < 0) {
+      if (maxBack === 0) {
+        return { handled: true, render: false };
+      }
+      const next = Math.min(maxBack, (this.scrollBack ?? 0) - delta);
+      if (next === this.scrollBack) {
+        return { handled: true, render: false };
+      }
+      this.scrollBack = next;
+      return { handled: true };
+    }
+    if (this.scrollBack === undefined) {
+      return { handled: true, render: false };
+    }
+    const next = this.scrollBack - delta;
+    if (next <= 0) {
+      this.scrollBack = undefined;
+      void this.refresh();
+    } else {
+      this.scrollBack = next;
+    }
+    return { handled: true };
+  }
+
+  private handlePress(y: number): TuiMouseEventResult | undefined {
+    if (this.confirmId || this.pathOffset !== undefined) {
+      return undefined;
+    }
+    const index = y - this.jobRowLayout.startY;
+    const id = index >= 0 ? this.jobRowLayout.ids[index] : undefined;
+    if (!id || id === this.selectedId) {
+      return undefined;
+    }
+    this.select(id);
+    void this.refresh();
+    return { handled: true, focus: true };
   }
 
   private switchJob(data: string, task: PanelTask) {

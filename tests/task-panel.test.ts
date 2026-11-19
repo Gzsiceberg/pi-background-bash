@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as wait } from "node:timers/promises";
 
-import { matchesKey, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, stripTerminalSequences, type TuiMouseEvent, visibleWidth } from "@earendil-works/pi-tui";
 
 import { createTaskPanel, type PanelTask, type PanelTheme } from "../src/task-panel.ts";
 
@@ -272,6 +272,74 @@ async function checkThemeTallPreviewAndOverflow(t: TestContext) {
   assert.ok(visibleRows.length > 12, `Expected >12 preview rows on tall terminal, got ${visibleRows.length}`);
 }
 
+function mouseEvent(overrides: Partial<TuiMouseEvent> & Pick<TuiMouseEvent, "type">): TuiMouseEvent {
+  return {
+    button: "none",
+    x: 4,
+    y: 0,
+    screenX: 4,
+    screenY: 0,
+    width: 80,
+    height: 19,
+    shift: false,
+    alt: false,
+    ctrl: false,
+    ...overrides,
+  };
+}
+
+async function checkMouseWheelAndClick(t: TestContext) {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-bg-mouse-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const firstLog = join(cwd, "first.log");
+  const secondLog = join(cwd, "second.log");
+  await writeFile(firstLog, Array.from({ length: 30 }, (_, i) => `first ${String(i + 1).padStart(2, "0")}\n`).join(""));
+  await writeFile(secondLog, "second job output\n");
+  const jobs: PanelTask[] = [
+    { id: "first", name: "First job", outputPath: firstLog, status: "running" },
+    { id: "second", name: "Second job", outputPath: secondLog, status: "completed", exitCode: 0 },
+  ];
+  const panel = createTaskPanel(
+    {
+      terminal: { rows: 24 } as Parameters<typeof createTaskPanel>[0]["terminal"],
+      requestRender() {
+        // Explicit rendering below.
+      },
+    },
+    { matches: () => false },
+    () => assert.fail("Panel closed"),
+    () => jobs,
+    () => Promise.reject(new Error("Unexpected stop")),
+  );
+  t.after(() => panel.dispose());
+  const display = () => panel.render(80).join("\n");
+  await until(() => display().includes("first 30"));
+  assert.match(display(), /LIVE/);
+
+  // Wheel up pauses LIVE and scrolls back.
+  const upResult = panel.handleMouse?.(mouseEvent({ type: "wheel", wheelDelta: -6 }));
+  assert.equal(upResult?.handled, true);
+  assert.match(display(), /⏸ PAUSED/);
+  assert.doesNotMatch(display(), /first 30/);
+
+  // Wheel down past the bottom automatically resumes LIVE and loads new output.
+  await appendFile(firstLog, "first 31\n");
+  const downResult = panel.handleMouse?.(mouseEvent({ type: "wheel", wheelDelta: 10 }));
+  assert.equal(downResult?.handled, true);
+  await until(() => display().includes("first 31"));
+  assert.match(display(), /LIVE/);
+
+  // Pressing on the log output area returns undefined so Pi's text selection can drag-select logs.
+  const outputPress = panel.handleMouse?.(mouseEvent({ type: "press", button: "left", y: 6 }));
+  assert.equal(outputPress, undefined);
+
+  // Left-clicking the second job row (y = 2: row 0 is top border, row 1 is first job, row 2 is second job).
+  const clickResult = panel.handleMouse?.(mouseEvent({ type: "press", button: "left", y: 2 }));
+  assert.equal(clickResult?.handled, true);
+  await until(() => display().includes("second job output"));
+  assert.match(display(), /› ✓ Second job/);
+}
+
 test("task panel marks clipped output and confirms stopping only the selected live job", posix, checkClippingAndStop);
 test("opens a job by ID, freezes scrollback, and shows its full log path", posix, checkScrollbackAndPath);
 test(
@@ -279,3 +347,4 @@ test(
   posix,
   checkThemeTallPreviewAndOverflow,
 );
+test("supports mouse wheel scrolling and clicking to select jobs", posix, checkMouseWheelAndClick);
