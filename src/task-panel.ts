@@ -279,7 +279,11 @@ class TaskPanel implements Component {
     if (rows === 1) {
       return [`${mode} ${clipped ? "… " : "· "}${lines[start]}`];
     }
-    return [`${mode}${clipped ? " · Output clipped" : ""}`, ...lines.slice(start, end)];
+    const output = lines.slice(start, end);
+    while (output.length < this.previewRows) {
+      output.push("");
+    }
+    return [`${mode}${clipped ? " · Output clipped" : ""}`, ...output];
   }
 
   private followMode(live: boolean) {

@@ -86,6 +86,7 @@ async function checkClippingAndStop(t: TestContext) {
   assert.match(display(), /\[completed\] Old test/);
   assert.ok(!display().includes("\x1b"));
   assert.doesNotMatch(display(), /live\.log/);
+  const initialHeight = panel.render(80).length;
 
   await appendFile(running.outputPath, "\x1b[31mnew output\x1b[0m\n");
   await until(() => display().includes("new output"));
@@ -106,6 +107,7 @@ async function checkClippingAndStop(t: TestContext) {
   await until(() => display().includes("last line"));
   assert.match(display(), /LIVE · Output clipped/);
   assert.doesNotMatch(display(), /first line/);
+  assert.equal(panel.render(80).length, initialHeight);
 
   assert.match(display(), /x stop/);
   panel.handleInput?.("x");
@@ -139,6 +141,7 @@ async function checkClippingAndStop(t: TestContext) {
   panel.handleInput?.("\x1b[A");
   await until(() => display().includes("previous output"));
   assert.match(display(), /› \[completed\] Old test/);
+  assert.equal(panel.render(80).length, initialHeight);
   panel.handleInput?.("x");
   panel.handleInput?.("y");
   assert.deepEqual(stopped, [running.id]);
