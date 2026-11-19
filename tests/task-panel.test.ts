@@ -5,9 +5,9 @@ import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { setTimeout as wait } from "node:timers/promises";
 
-import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
-import { createTaskPanel, type PanelTask } from "../src/task-panel.ts";
+import { createTaskPanel, type PanelTask, type PanelTheme } from "../src/task-panel.ts";
 
 async function until(check: () => boolean) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -29,12 +29,15 @@ async function checkClippingAndStop(t: TestContext) {
     name: "Live build",
     outputPath: join(cwd, "live.log"),
     status: "running",
+    startedAt: new Date(Date.now() - 5000).toISOString(),
   };
   const finished: PanelTask = {
     id: "done",
     name: "Old test",
     outputPath: join(cwd, "old.log"),
     status: "completed",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: "2026-01-01T00:01:05.000Z",
     exitCode: 0,
   };
   await writeFile(running.outputPath, "first line\n");
@@ -78,12 +81,14 @@ async function checkClippingAndStop(t: TestContext) {
   );
   t.after(() => panel.dispose?.());
   const display = () => panel.render(80).join("\n");
+  assert.match(display(), /Background Tasks/);
   assert.match(display(), /No background tasks/);
   assert.match(display(), /Ask Pi to run your tests in the background/);
   jobs = [running, finished];
   await until(() => display().includes("first line"));
-  assert.match(display(), /› \[running\] Live build/);
-  assert.match(display(), /\[completed\] Old test/);
+  assert.match(display(), /Background Tasks · 1 running/);
+  assert.match(display(), /› [⠋⠙⠹⠸] Live build/);
+  assert.match(display(), /✓ Old test.*1m 5s/);
   assert.ok(!display().includes("\x1b"));
   assert.doesNotMatch(display(), /live\.log/);
   const initialHeight = panel.render(80).length;
@@ -98,14 +103,14 @@ async function checkClippingAndStop(t: TestContext) {
   );
   assert.ok(panel.render(12).every((line) => visibleWidth(line) <= 12));
 
-  assert.doesNotMatch(display(), /Output clipped/);
+  assert.doesNotMatch(display(), /lines \d+–\d+ of/);
   terminal.rows = 4;
   assert.match(display(), /… new output/);
   assert.match(display(), /Esc close/);
   terminal.rows = 24;
   await appendFile(running.outputPath, `${"line\n".repeat(13)}last line\n`);
   await until(() => display().includes("last line"));
-  assert.match(display(), /LIVE · Output clipped/);
+  assert.match(display(), /[⠋⠙⠹⠸] LIVE.*lines \d+–16 of 16/);
   assert.doesNotMatch(display(), /first line/);
   assert.equal(panel.render(80).length, initialHeight);
 
@@ -119,7 +124,7 @@ async function checkClippingAndStop(t: TestContext) {
   panel.handleInput?.("x");
   panel.handleInput?.("y");
   assert.deepEqual(stopped, [running.id]);
-  assert.match(display(), /› \[stopping\].*Live build/);
+  assert.match(display(), /› ◌ Live build.*stopping/);
   panel.handleInput?.("x");
   panel.handleInput?.("y");
   assert.deepEqual(stopped, [running.id]);
@@ -129,18 +134,19 @@ async function checkClippingAndStop(t: TestContext) {
     {
       ...running,
       status: "killed",
+      finishedAt: new Date().toISOString(),
       error: "Stopped from /bg-tasks",
     },
   ];
   assert.ok(finishStop);
   finishStop();
-  await until(() => /› \[killed\].*Live build/.test(display()));
+  await until(() => /› ■ Live build.*stopped/.test(display()));
   assert.doesNotMatch(display(), /Stopped from \/bg-tasks/);
   assert.match(display(), /last line/);
 
   panel.handleInput?.("\x1b[A");
   await until(() => display().includes("previous output"));
-  assert.match(display(), /› \[completed\] Old test/);
+  assert.match(display(), /› ✓ Old test/);
   assert.equal(panel.render(80).length, initialHeight);
   panel.handleInput?.("x");
   panel.handleInput?.("y");
@@ -189,13 +195,13 @@ async function checkScrollbackAndPath(t: TestContext) {
   const display = (width = 80) => panel.render(width).join("\n");
   const press = (key: string) => panel.handleInput?.(key);
   await until(() => display().includes("entry 36"));
-  assert.match(display(), /› \[running\].*Chosen job/);
+  assert.match(display(), /› [⠋⠙⠹⠸] Chosen job/);
   assert.match(display(), /LIVE/);
 
   press("\x1b[5~"); // Page Up
   const earlier = display().match(/entry \d+/g);
   assert.ok(earlier?.length);
-  assert.match(display(), /PAUSED/);
+  assert.match(display(), /⏸ PAUSED/);
   assert.doesNotMatch(display(), /entry 36/);
   press("\x1b[6~"); // Page Down
   assert.match(display(), /entry 36/);
@@ -210,8 +216,8 @@ async function checkScrollbackAndPath(t: TestContext) {
   assert.ok(display(180).includes(path));
   const wrapped = panel
     .render(20)
-    .slice(2, -2)
-    .map((line) => line.slice(1, -1).trimEnd())
+    .slice(1, -3)
+    .map((line) => line.slice(1, -1).trim())
     .join("");
   assert.equal(wrapped, path);
   press("\x1b");
@@ -221,5 +227,55 @@ async function checkScrollbackAndPath(t: TestContext) {
   assert.match(display(), /LIVE/);
 }
 
+async function checkThemeTallPreviewAndOverflow(t: TestContext) {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-bg-theme-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const logPath = join(cwd, "tall.log");
+  await writeFile(logPath, Array.from({ length: 30 }, (_, i) => `row ${String(i + 1).padStart(2, "0")}\n`).join(""));
+  const jobs: PanelTask[] = Array.from({ length: 7 }, (_, i) => ({
+    id: `job-${i + 1}`,
+    name: `Task ${i + 1}`,
+    outputPath: logPath,
+    status: i === 0 ? "running" : "completed",
+    startedAt: "2026-01-01T00:00:00.000Z",
+    finishedAt: i === 0 ? undefined : "2026-01-01T00:00:12.000Z",
+  }));
+  const mockTheme: PanelTheme = {
+    fg: (_color, text) => `\x1b[36m${text}\x1b[39m`,
+    bg: (_color, text) => `\x1b[44m${text}\x1b[49m`,
+    bold: (text) => `\x1b[1m${text}\x1b[22m`,
+  };
+  const panel = createTaskPanel(
+    {
+      terminal: { rows: 40 } as Parameters<typeof createTaskPanel>[0]["terminal"],
+      requestRender() {
+        // Explicit rendering below.
+      },
+    },
+    { matches: () => false },
+    () => assert.fail("Panel closed"),
+    () => jobs,
+    () => Promise.reject(new Error("Unexpected stop")),
+    undefined,
+    mockTheme,
+  );
+  t.after(() => panel.dispose());
+  const render = (width = 90) => panel.render(width);
+  await until(() => stripTerminalSequences(render().join("\n")).includes("row 30"));
+
+  const lines = render(90);
+  assert.ok(lines.every((line) => visibleWidth(line) === 90));
+  assert.ok(lines.some((line) => line.includes("\x1b[44m")));
+  const plain = stripTerminalSequences(lines.join("\n"));
+  assert.match(plain, /Background Tasks · 1 running · 1\/7/);
+  const visibleRows = plain.match(/row \d+/g) ?? [];
+  assert.ok(visibleRows.length > 12, `Expected >12 preview rows on tall terminal, got ${visibleRows.length}`);
+}
+
 test("task panel marks clipped output and confirms stopping only the selected live job", posix, checkClippingAndStop);
 test("opens a job by ID, freezes scrollback, and shows its full log path", posix, checkScrollbackAndPath);
+test(
+  "applies theme styling, fills tall preview height, and shows job overflow count",
+  posix,
+  checkThemeTallPreviewAndOverflow,
+);

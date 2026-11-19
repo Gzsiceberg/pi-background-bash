@@ -15,7 +15,7 @@ import { createTasks, MAX_TIMEOUT_SECONDS, type RunOptions } from "./tasks.ts";
 
 const notificationType = "background-task-notification";
 const FOOTER_KEY = "pi-background-bash";
-const MAX_FINISHED_JOBS = 20;
+const MAX_FINISHED_JOBS = 5;
 
 // Quote paths and names so they stay on one line and cannot close the notification tag.
 function quote(value: string): string {
@@ -144,12 +144,14 @@ function registerPanel(pi: ExtensionAPI, { jobs, tasks }: ReturnType<typeof crea
         return;
       }
       await ctx.ui.custom<void>(
-        (tui, _theme, keys, done) => createTaskPanel(tui, keys, done, listJobs, stopFromPanel, initialId || undefined),
+        (tui, theme, keys, done) =>
+          createTaskPanel(tui, keys, done, listJobs, stopFromPanel, initialId || undefined, theme),
         {
           overlay: true,
           overlayOptions: {
             anchor: "center",
-            width: 80,
+            width: "90%",
+            minWidth: 60,
             maxHeight: "80%",
             margin: { left: 1, right: 1 },
           },
