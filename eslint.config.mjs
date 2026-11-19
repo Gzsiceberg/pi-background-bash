@@ -84,6 +84,24 @@ export default defineConfig(
     rules: {
       "max-lines-per-function": ["error", { max: 80, skipBlankLines: true, skipComments: true }],
       "no-console": "error",
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "SpreadElement > ConditionalExpression",
+          message:
+            "Avoid conditional spreads (...(cond ? [x] : [])); build the array or object with an if statement instead.",
+        },
+        {
+          selector: 'Property > CallExpression[callee.property.name="join"][callee.object.type="ArrayExpression"]',
+          message: "Avoid inline [...].join(...) inside object properties; format the string in a variable or helper.",
+        },
+        {
+          selector:
+            "ReturnStatement :matches(ObjectExpression, ArrayExpression) :matches(ObjectExpression, ArrayExpression) :matches(ObjectExpression, ArrayExpression) :matches(ObjectExpression, ArrayExpression)",
+          message:
+            "Avoid deeply nested inline literals in return statements; extract intermediate variables or helpers.",
+        },
+      ],
     },
   },
   {

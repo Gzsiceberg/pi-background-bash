@@ -219,21 +219,15 @@ function registerRunTool(pi: ExtensionAPI, startTask: ReturnType<typeof createSe
     async execute(_toolCallId, options, signal, _onUpdate, ctx) {
       const task = await startTask(ctx, options, signal);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Started background task ${quote(task.name)} (${task.id})`,
-              `Status: ${task.status}; PID: ${task.pid}`,
-              `Output: ${quote(task.outputPath)}`,
-              `Result (written on completion): ${quote(task.resultPath)}`,
-              completionGuidance(task),
-            ].join("\n"),
-          },
-        ],
-        details: { task },
-      };
+      const text = [
+        `Started background task ${quote(task.name)} (${task.id})`,
+        `Status: ${task.status}; PID: ${task.pid}`,
+        `Output: ${quote(task.outputPath)}`,
+        `Result (written on completion): ${quote(task.resultPath)}`,
+        completionGuidance(task),
+      ].join("\n");
+      const content = [{ type: "text" as const, text }];
+      return { content, details: { task } };
     },
   });
 }
