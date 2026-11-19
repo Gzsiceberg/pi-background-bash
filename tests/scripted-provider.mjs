@@ -19,7 +19,7 @@ export default function (pi) {
         type: 'toolCall', id: 'test-bg-run', name: 'bg_run',
         arguments: {
           name: 'Fixture build',
-          command: "while [[ ! -f proceed ]]; do sleep 0.02; done; printf 'fixture output\\n'",
+          command: "printf 'fixture live marker\\n'; while [[ ! -f proceed ]]; do sleep 0.02; done; printf 'fixture output\\n'",
           timeoutSeconds: 8,
         },
       };
