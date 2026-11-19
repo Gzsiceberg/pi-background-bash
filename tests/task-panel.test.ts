@@ -1,10 +1,12 @@
-import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
 import assert from "node:assert/strict";
 import { appendFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as wait } from "node:timers/promises";
+
+import { matchesKey, visibleWidth } from "@earendil-works/pi-tui";
+
 import { createTaskPanel, type PanelTask } from "../src/task-panel.ts";
 
 async function until(check: () => boolean) {
@@ -177,18 +179,10 @@ test(
       },
     ];
     const path = jobs[1].outputPath;
-    await writeFile(
-      path,
-      Array.from(
-        { length: 36 },
-        (_, i) => `entry ${String(i + 1).padStart(2, "0")}\n`,
-      ).join(""),
-    );
+    await writeFile(path, Array.from({ length: 36 }, (_, i) => `entry ${String(i + 1).padStart(2, "0")}\n`).join(""));
     const panel = createTaskPanel(
       {
-        terminal: { rows: 24 } as Parameters<
-          typeof createTaskPanel
-        >[0]["terminal"],
+        terminal: { rows: 24 } as Parameters<typeof createTaskPanel>[0]["terminal"],
         requestRender() {
           // This test renders explicitly when inspecting the panel.
         },

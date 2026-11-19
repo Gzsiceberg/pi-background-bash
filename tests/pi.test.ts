@@ -8,8 +8,7 @@ import { createInterface } from "node:readline";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const projectFile = (path: string) =>
-  fileURLToPath(new URL(path, import.meta.url));
+const projectFile = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 
 const posix = { skip: process.platform === "win32", timeout: 15_000 };
 
@@ -61,59 +60,40 @@ async function openPi(t: TestContext) {
   };
 }
 
-test(
-  "Pi loads bg_run and wakes the model after a background job finishes",
-  posix,
-  async (t) => {
-    const { cwd, lines, send, close } = await openPi(t);
-    send({ id: "prompt", type: "prompt", message: "Run the fixture job" });
-    let notified = false;
-    let outputPath: string | undefined;
-    try {
-      for await (const line of lines) {
-        const event = JSON.parse(line);
-        const text = JSON.stringify(event);
-        if (event.type === "response" && event.id === "prompt") {
-          assert.equal(event.success, true, text);
-        }
-        if (
-          event.type === "agent_end" &&
-          text.includes("Fixture initial reply")
-        ) {
-          assert.equal(notified, false);
-          await writeFile(join(cwd, "proceed"), "");
-        }
-        if (
-          event.type === "message_end" &&
-          event.message.customType === "background-task-notification"
-        ) {
-          assert.equal(notified, false);
-          assert.equal(event.message.details.task.status, "completed");
-          assert.match(
-            event.message.content.split("\n")[1],
-            /^".+" completed · \d+s$/,
-          );
-          assert.doesNotMatch(
-            event.message.content,
-            /fixture (live marker|output)/,
-          );
-          outputPath = event.message.details.task.outputPath;
-          notified = true;
-        }
-        if (event.type === "agent_end" && text.includes("Fixture follow-up")) {
-          break;
-        }
+test("Pi loads bg_run and wakes the model after a background job finishes", posix, async (t) => {
+  const { cwd, lines, send, close } = await openPi(t);
+  send({ id: "prompt", type: "prompt", message: "Run the fixture job" });
+  let notified = false;
+  let outputPath: string | undefined;
+  try {
+    for await (const line of lines) {
+      const event = JSON.parse(line);
+      const text = JSON.stringify(event);
+      if (event.type === "response" && event.id === "prompt") {
+        assert.equal(event.success, true, text);
       }
-    } finally {
-      await close();
+      if (event.type === "agent_end" && text.includes("Fixture initial reply")) {
+        assert.equal(notified, false);
+        await writeFile(join(cwd, "proceed"), "");
+      }
+      if (event.type === "message_end" && event.message.customType === "background-task-notification") {
+        assert.equal(notified, false);
+        assert.equal(event.message.details.task.status, "completed");
+        assert.match(event.message.content.split("\n")[1], /^".+" completed · \d+s$/);
+        assert.doesNotMatch(event.message.content, /fixture (live marker|output)/);
+        outputPath = event.message.details.task.outputPath;
+        notified = true;
+      }
+      if (event.type === "agent_end" && text.includes("Fixture follow-up")) {
+        break;
+      }
     }
-    assert.ok(notified && outputPath);
-    assert.equal(
-      await readFile(outputPath, "utf8"),
-      "fixture live marker\nfixture output\n",
-    );
-  },
-);
+  } finally {
+    await close();
+  }
+  assert.ok(notified && outputPath);
+  assert.equal(await readFile(outputPath, "utf8"), "fixture live marker\nfixture output\n");
+});
 
 test("Pi registers /bg-tasks but not /bg", posix, async (t) => {
   const { lines, send, close } = await openPi(t);
@@ -126,9 +106,7 @@ test("Pi registers /bg-tasks but not /bg", posix, async (t) => {
         continue;
       }
       assert.equal(event.success, true, line);
-      const names = event.data.commands.map(
-        (command: { name: string }) => command.name,
-      );
+      const names = event.data.commands.map((command: { name: string }) => command.name);
       assert.ok(names.includes("bg-tasks"));
       assert.ok(!names.includes("bg"));
       checked = true;

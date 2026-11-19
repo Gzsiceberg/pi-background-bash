@@ -1,11 +1,13 @@
+import { join } from "node:path";
+
 import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
   type ExtensionContext,
   type ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
-import { join } from "node:path";
 import { Type } from "typebox";
+
 import { plainText } from "./log-tail.ts";
 import { createTaskPanel, type PanelTask } from "./task-panel.ts";
 import { formatDuration } from "./task-presentation.ts";
@@ -17,12 +19,10 @@ const MAX_FINISHED_JOBS = 20;
 
 // Quote paths and names so they stay on one line and cannot close the notification tag.
 function quote(value: string): string {
-  return JSON.stringify(value)
-    .replaceAll("<", "\\u003c")
-    .replaceAll(">", "\\u003e");
+  return JSON.stringify(value).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e");
 }
 
-export default function (pi: ExtensionAPI) {
+function createSession(pi: ExtensionAPI) {
   const tasks = createTasks();
   const jobs = new Map<string, PanelTask>();
   const finishedIds: string[] = [];
@@ -30,80 +30,45 @@ export default function (pi: ExtensionAPI) {
 
   function updateFooter(ui: ExtensionUIContext) {
     const running = jobs.size - finishedIds.length;
-    ui.setStatus(
-      FOOTER_KEY,
-      running > 0 ? `bg ${running} running · /bg-tasks` : undefined,
-    );
+    ui.setStatus(FOOTER_KEY, running > 0 ? `bg ${running} running · /bg-tasks` : undefined);
   }
 
-  async function startTask(
-    ctx: ExtensionContext,
-    options: RunOptions,
-    signal?: AbortSignal,
-  ) {
-    const { task, done } = await tasks.run(
-      ctx.cwd,
-      join(ctx.cwd, CONFIG_DIR_NAME, "tasks"),
-      options,
-      signal,
-    );
+  async function startTask(ctx: ExtensionContext, options: RunOptions, signal?: AbortSignal) {
+    const { task, done } = await tasks.run(ctx.cwd, join(ctx.cwd, CONFIG_DIR_NAME, "tasks"), options, signal);
     if (!shuttingDown && ctx.mode === "tui") {
       jobs.set(task.id, task);
       updateFooter(ctx.ui);
     }
-    void done
-      .then((result) => {
-        if (shuttingDown) {
-          return;
-        }
-        if (jobs.delete(result.id)) {
-          jobs.set(result.id, result);
-          finishedIds.push(result.id);
-          if (finishedIds.length > MAX_FINISHED_JOBS) {
-            jobs.delete(finishedIds.shift()!);
-          }
-          updateFooter(ctx.ui);
-        }
-        if (!result.notifyOnCompletion) {
-          return;
-        }
-        pi.sendMessage(
-          {
-            customType: notificationType,
-            display: true,
-            details: { task: result },
-            content: [
-              `<${notificationType}>`,
-              `${quote(result.name)} ${result.status}${
-                result.exitCode == null || result.exitCode === 0
-                  ? ""
-                  : ` · exit ${result.exitCode}`
-              } · ${formatDuration(result.startedAt, result.finishedAt)}`,
-              `Task ID: ${result.id}`,
-              ...(result.error ? [`Error: ${quote(result.error)}`] : []),
-              ...(ctx.mode === "tui" ? [`View: /bg-tasks ${result.id}`] : []),
-              `Output: ${quote(result.outputPath)}`,
-              result.metadataError
-                ? quote(result.metadataError)
-                : `Result: ${quote(result.resultPath)}`,
-              `</${notificationType}>`,
-            ].join("\n"),
-          },
-          { deliverAs: "followUp", triggerTurn: result.triggerOnCompletion },
-        );
-      })
-      .catch((error: unknown) => {
-        if (!shuttingDown) {
-          ctx.ui.notify(
-            `Background task completion error: ${String(error)}`,
-            "error",
-          );
-        }
-      });
+    void handleCompletion(ctx, done);
     return task;
   }
 
-  pi.on("session_shutdown", async ({ reason }, ctx) => {
+  async function handleCompletion(ctx: ExtensionContext, done: TaskCompletion) {
+    try {
+      const result = await done;
+      if (shuttingDown) {
+        return;
+      }
+      if (jobs.delete(result.id)) {
+        jobs.set(result.id, result);
+        finishedIds.push(result.id);
+        if (finishedIds.length > MAX_FINISHED_JOBS) {
+          jobs.delete(finishedIds.shift()!);
+        }
+        updateFooter(ctx.ui);
+      }
+      if (!result.notifyOnCompletion) {
+        return;
+      }
+      sendCompletion(pi, ctx, result);
+    } catch (error) {
+      if (!shuttingDown) {
+        ctx.ui.notify(`Background task completion error: ${String(error)}`, "error");
+      }
+    }
+  }
+
+  async function shutdown(reason: string, ctx: ExtensionContext) {
     shuttingDown = true;
     jobs.clear();
     finishedIds.length = 0;
@@ -111,25 +76,46 @@ export default function (pi: ExtensionAPI) {
       updateFooter(ctx.ui);
     }
     await tasks.shutdown(`Pi session ended (${reason})`);
-  });
+  }
 
+  return { jobs, tasks, startTask, shutdown };
+}
+
+type TaskCompletion = Awaited<ReturnType<ReturnType<typeof createTasks>["run"]>>["done"];
+
+function sendCompletion(pi: ExtensionAPI, ctx: ExtensionContext, result: Awaited<TaskCompletion>) {
+  pi.sendMessage(
+    {
+      customType: notificationType,
+      display: true,
+      details: { task: result },
+      content: [
+        `<${notificationType}>`,
+        `${quote(result.name)} ${result.status}${
+          result.exitCode == null || result.exitCode === 0 ? "" : ` · exit ${result.exitCode}`
+        } · ${formatDuration(result.startedAt, result.finishedAt)}`,
+        `Task ID: ${result.id}`,
+        ...(result.error ? [`Error: ${quote(result.error)}`] : []),
+        ...(ctx.mode === "tui" ? [`View: /bg-tasks ${result.id}`] : []),
+        `Output: ${quote(result.outputPath)}`,
+        result.metadataError ? quote(result.metadataError) : `Result: ${quote(result.resultPath)}`,
+        `</${notificationType}>`,
+      ].join("\n"),
+    },
+    { deliverAs: "followUp", triggerTurn: result.triggerOnCompletion },
+  );
+}
+
+function registerPanel(pi: ExtensionAPI, { jobs, tasks }: ReturnType<typeof createSession>) {
   const listJobs = () =>
-    [...jobs.values()]
-      .reverse()
-      .sort(
-        (a, b) =>
-          Number(b.status === "running") - Number(a.status === "running"),
-      );
+    [...jobs.values()].reverse().sort((a, b) => Number(b.status === "running") - Number(a.status === "running"));
 
   pi.registerCommand("bg-tasks", {
     description: "Pick a background job, follow its output, or stop it",
     getArgumentCompletions(prefix) {
       const query = prefix.trim().toLowerCase();
       return listJobs()
-        .filter(
-          (job) =>
-            job.id.startsWith(query) || job.name.toLowerCase().includes(query),
-        )
+        .filter((job) => job.id.startsWith(query) || job.name.toLowerCase().includes(query))
         .map((job) => ({
           value: job.id,
           label: plainText(job.name),
@@ -138,18 +124,12 @@ export default function (pi: ExtensionAPI) {
     },
     async handler(args, ctx) {
       if (ctx.mode !== "tui") {
-        ctx.ui.notify(
-          "/bg-tasks requires interactive Pi. Use the log path returned by bg_run.",
-          "warning",
-        );
+        ctx.ui.notify("/bg-tasks requires interactive Pi. Use the log path returned by bg_run.", "warning");
         return;
       }
       const initialId = args.trim();
       if (initialId && !jobs.has(initialId)) {
-        ctx.ui.notify(
-          "Task not found in this Pi session. Use /bg-tasks to see available jobs.",
-          "warning",
-        );
+        ctx.ui.notify("Task not found in this Pi session. Use /bg-tasks to see available jobs.", "warning");
         return;
       }
       await ctx.ui.custom<void>(
@@ -176,7 +156,18 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+}
 
+function completionGuidance(task: { triggerOnCompletion: boolean; notifyOnCompletion: boolean }) {
+  if (task.triggerOnCompletion) {
+    return "Pi will follow up on completion; do not poll or sleep to wait.";
+  }
+  return task.notifyOnCompletion
+    ? "A completion notification will be displayed without starting a turn."
+    : "Completion notifications are disabled.";
+}
+
+function registerRunTool(pi: ExtensionAPI, startTask: ReturnType<typeof createSession>["startTask"]) {
   pi.registerTool({
     name: "bg_run",
     label: "Background Bash",
@@ -208,8 +199,7 @@ export default function (pi: ExtensionAPI) {
           Type.Number({
             exclusiveMinimum: 0,
             maximum: MAX_TIMEOUT_SECONDS,
-            description:
-              "Stop and fail the task after this many seconds; omit for no timeout",
+            description: "Stop and fail the task after this many seconds; omit for no timeout",
           }),
         ),
         notifyOnCompletion: Type.Optional(
@@ -219,8 +209,7 @@ export default function (pi: ExtensionAPI) {
         ),
         triggerOnCompletion: Type.Optional(
           Type.Boolean({
-            description:
-              "Start a follow-up turn on completion (default true; requires notifications)",
+            description: "Start a follow-up turn on completion (default true; requires notifications)",
           }),
         ),
       },
@@ -238,11 +227,7 @@ export default function (pi: ExtensionAPI) {
               `Status: ${task.status}; PID: ${task.pid}`,
               `Output: ${quote(task.outputPath)}`,
               `Result (written on completion): ${quote(task.resultPath)}`,
-              task.triggerOnCompletion
-                ? "Pi will follow up on completion; do not poll or sleep to wait."
-                : task.notifyOnCompletion
-                  ? "A completion notification will be displayed without starting a turn."
-                  : "Completion notifications are disabled.",
+              completionGuidance(task),
             ].join("\n"),
           },
         ],
@@ -250,4 +235,11 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+}
+
+export default function (pi: ExtensionAPI) {
+  const session = createSession(pi);
+  pi.on("session_shutdown", ({ reason }, ctx) => session.shutdown(reason, ctx));
+  registerPanel(pi, session);
+  registerRunTool(pi, session.startTask);
 }

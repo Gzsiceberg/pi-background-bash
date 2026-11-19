@@ -1,13 +1,13 @@
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { type ChildProcessByStdio, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, open, rename, rm, writeFile } from "node:fs/promises";
+import { type FileHandle, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { PassThrough, Transform, type Readable } from "node:stream";
+import { PassThrough, type Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 export const MAX_OUTPUT_BYTES = 20 * 1024 * 1024;
-export const MAX_TIMEOUT_SECONDS = 2_147_483; // Largest whole seconds accepted by Node's timer.
+export const MAX_TIMEOUT_SECONDS = 2_147_483;
 
 export interface RunOptions {
   name: string;
@@ -31,29 +31,215 @@ interface Task {
   triggerOnCompletion: boolean;
 }
 
-type Result = Task & {
-  status: "completed" | "failed" | "killed";
-  finishedAt: string;
+interface Exit {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
-  error?: string;
-  metadataError?: string;
-};
+}
+
+export type Result = Task &
+  Exit & {
+    status: "completed" | "failed" | "killed";
+    finishedAt: string;
+    error?: string;
+    metadataError?: string;
+  };
+
+type Child = ChildProcessByStdio<null, Readable, Readable>;
+interface StopReason {
+  status: "failed" | "killed";
+  error: string;
+}
+type Cancel = (reason: string) => Promise<Result>;
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function validate(options: RunOptions) {
+  if (process.platform === "win32") {
+    throw new Error("bg_run requires a POSIX host with Bash");
+  }
+  const name = options.name.trim();
+  if (!name || name.length > 120) {
+    throw new Error("bg_run needs a name of 1–120 characters");
+  }
+  if (!options.command.trim()) {
+    throw new Error("Background command is empty");
+  }
+  const { timeoutSeconds } = options;
+  if (
+    timeoutSeconds !== undefined &&
+    (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > MAX_TIMEOUT_SECONDS)
+  ) {
+    throw new Error(`timeoutSeconds must be positive and at most ${MAX_TIMEOUT_SECONDS}`);
+  }
+  return name;
+}
+
+async function startProcess(
+  task: Omit<Task, "pid" | "startedAt">,
+  options: RunOptions,
+  checkAdmission: () => void,
+  active: Map<string, Cancel>,
+) {
+  const log = await open(task.outputPath, "wx", 0o600);
+  let child: Child;
+  try {
+    checkAdmission();
+    child = spawn("bash", ["-c", options.command], {
+      cwd: task.cwd,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (error) {
+    await log.close();
+    throw error;
+  }
+  const processTask = new TaskProcess(child, { ...task, pid: child.pid, startedAt: new Date().toISOString() }, log);
+  return processTask.track(active, options.timeoutSeconds);
+}
+
+function exitError(exit: Exit) {
+  if (exit.signal) {
+    return `Bash exited on ${exit.signal}`;
+  }
+  return exit.exitCode === 0 ? undefined : `Bash exited with code ${exit.exitCode}`;
+}
+
+async function saveResult(result: Result) {
+  try {
+    const temporary = `${result.resultPath}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(result, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+    await rename(temporary, result.resultPath);
+  } catch (cause) {
+    result.metadataError = `Could not save result: ${message(cause)}`;
+  }
+  return result;
+}
+
+class TaskProcess {
+  private readonly merged = new PassThrough();
+  private terminal = false;
+  private stopped?: StopReason;
+  private closePipes?: NodeJS.Timeout;
+  private timer?: NodeJS.Timeout;
+  private spawnError?: string;
+  private readonly exited: Promise<Exit>;
+  private readonly drained: Promise<string | undefined>;
+  private readonly started: Promise<unknown>;
+
+  private readonly child: Child;
+  readonly task: Task;
+
+  constructor(child: Child, task: Task, log: FileHandle) {
+    this.child = child;
+    this.task = task;
+    child.on("error", (error) => {
+      this.spawnError = message(error);
+    });
+    this.started = once(child, "spawn");
+    this.exited = new Promise((resolve) => {
+      child.once("close", (exitCode, signal) => {
+        this.terminal = true;
+        clearTimeout(this.timer);
+        clearTimeout(this.closePipes);
+        this.merged.end();
+        resolve({ exitCode, signal });
+      });
+    });
+    this.drained = this.drainOutput(log);
+    child.stdout.pipe(this.merged, { end: false });
+    child.stderr.pipe(this.merged, { end: false });
+  }
+
+  private async drainOutput(log: FileHandle) {
+    let bytes = 0;
+    const bounded = new Transform({
+      transform: (chunk: Buffer, _encoding, callback) => {
+        const size = Math.min(chunk.length, MAX_OUTPUT_BYTES - bytes);
+        bytes += size;
+        if (size < chunk.length) {
+          this.stop("failed", "Output exceeded the 20 MiB limit");
+        }
+        callback(null, chunk.subarray(0, size));
+      },
+    });
+    try {
+      await pipeline(this.merged, bounded, log.createWriteStream());
+    } catch (error) {
+      const reason = `Could not write task output: ${message(error)}`;
+      this.stop("failed", reason);
+      this.child.stdout.resume();
+      this.child.stderr.resume();
+      return reason;
+    }
+  }
+
+  private stop(status: StopReason["status"], error: string) {
+    if (this.stopped || (this.terminal && status === "killed")) {
+      return;
+    }
+    this.stopped = { status, error };
+    if (this.terminal) {
+      return;
+    }
+    try {
+      // Detached Bash leads an owned POSIX process group.
+      if (this.task.pid !== undefined) {
+        process.kill(-this.task.pid, "SIGKILL");
+      }
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code !== "ESRCH") {
+        this.stopped = { status: "failed", error: `${error}; could not stop Bash group: ${message(cause)}` };
+      }
+    }
+    // Allow buffered data to drain without waiting for escaped descendants forever.
+    this.closePipes = setTimeout(() => {
+      this.child.stdout.destroy();
+      this.child.stderr.destroy();
+    }, 250);
+  }
+
+  async track(active: Map<string, Cancel>, timeoutSeconds?: number) {
+    if (timeoutSeconds !== undefined) {
+      this.timer = setTimeout(() => this.stop("failed", `Timed out after ${timeoutSeconds}s`), timeoutSeconds * 1000);
+    }
+    const done = this.finish(active);
+    active.set(this.task.id, (reason) => {
+      this.stop("killed", reason);
+      return done;
+    });
+    try {
+      await this.started;
+    } catch (error) {
+      await done;
+      throw new Error(`Could not start Bash: ${message(error)}`, { cause: error });
+    }
+    return { task: { ...this.task, status: "running" as const }, done };
+  }
+
+  private async finish(active: Map<string, Cancel>): Promise<Result> {
+    try {
+      const [exit, logError] = await Promise.all([this.exited, this.drained]);
+      const error = this.stopped?.error ?? logError ?? this.spawnError ?? exitError(exit);
+      return await saveResult({
+        ...this.task,
+        ...exit,
+        status: this.stopped?.status ?? (error ? "failed" : "completed"),
+        finishedAt: new Date().toISOString(),
+        error,
+      });
+    } finally {
+      active.delete(this.task.id);
+    }
+  }
+}
+
 export function createTasks() {
   let closed = false;
-  const active = new Map<string, (reason: string) => Promise<Result>>();
+  const active = new Map<string, Cancel>();
 
-  async function run(
-    cwd: string,
-    taskRoot: string,
-    options: RunOptions,
-    signal?: AbortSignal,
-  ) {
+  async function run(cwd: string, taskRoot: string, options: RunOptions, signal?: AbortSignal) {
     const checkAdmission = () => {
       signal?.throwIfAborted();
       if (closed) {
@@ -61,194 +247,34 @@ export function createTasks() {
       }
     };
     checkAdmission();
-    if (process.platform === "win32") {
-      throw new Error("bg_run requires a POSIX host with Bash");
-    }
-    const name = options.name.trim();
-    if (!name || name.length > 120) {
-      throw new Error("bg_run needs a name of 1–120 characters");
-    }
-    if (!options.command.trim()) {
-      throw new Error("Background command is empty");
-    }
-    const { timeoutSeconds } = options;
-    if (
-      timeoutSeconds !== undefined &&
-      (!Number.isFinite(timeoutSeconds) ||
-        timeoutSeconds <= 0 ||
-        timeoutSeconds > MAX_TIMEOUT_SECONDS)
-    ) {
-      throw new Error(
-        `timeoutSeconds must be positive and at most ${MAX_TIMEOUT_SECONDS}`,
-      );
-    }
+    const name = validate(options);
     const id = randomUUID();
     await mkdir(taskRoot, { recursive: true, mode: 0o700 });
     const directory = join(taskRoot, id);
     await mkdir(directory, { mode: 0o700 });
-    const outputPath = join(directory, "output.log");
-    const resultPath = join(directory, "result.json");
+    const notifyOnCompletion = options.notifyOnCompletion ?? true;
     try {
-      const log = await open(outputPath, "wx", 0o600);
-      let child: ChildProcessByStdio<null, Readable, Readable>;
-      try {
-        checkAdmission();
-        child = spawn("bash", ["-c", options.command], {
+      return await startProcess(
+        {
+          id,
+          name,
           cwd,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-      } catch (error) {
-        await log.close();
-        throw error;
-      }
-
-      const notifyOnCompletion = options.notifyOnCompletion ?? true;
-      const task: Task = {
-        id,
-        name,
-        cwd,
-        outputPath,
-        resultPath,
-        description: options.description,
-        pid: child.pid,
-        startedAt: new Date().toISOString(),
-        notifyOnCompletion,
-        triggerOnCompletion:
-          notifyOnCompletion && (options.triggerOnCompletion ?? true),
-      };
-      let terminal = false;
-      let stopped: { status: "failed" | "killed"; error: string } | undefined;
-      let closePipes: NodeJS.Timeout | undefined;
-      function stopProcess(status: "failed" | "killed", error: string) {
-        if (stopped || (terminal && status === "killed")) {
-          return;
-        }
-        stopped = { status, error };
-        if (terminal) {
-          return;
-        }
-        try {
-          // detached: true makes Bash the leader of a new POSIX process group.
-          if (task.pid !== undefined) {
-            process.kill(-task.pid, "SIGKILL");
-          }
-        } catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code !== "ESRCH") {
-            stopped = {
-              status: "failed",
-              error: `${error}; could not stop Bash group: ${message(cause)}`,
-            };
-          }
-        }
-        // Drain buffered output, but a process that left Bash's group could hold the pipes open.
-        closePipes = setTimeout(() => {
-          child.stdout.destroy();
-          child.stderr.destroy();
-        }, 250);
-      }
-
-      let timer: NodeJS.Timeout | undefined;
-      let spawnError: string | undefined;
-      child.on("error", (error) => {
-        spawnError = message(error);
-      });
-      const started = once(child, "spawn");
-      const merged = new PassThrough();
-      const exited = new Promise<{
-        exitCode: number | null;
-        signal: NodeJS.Signals | null;
-      }>((resolve) => {
-        child.once("close", (exitCode, exitSignal) => {
-          terminal = true;
-          clearTimeout(timer);
-          clearTimeout(closePipes);
-          merged.end();
-          resolve({ exitCode, signal: exitSignal });
-        });
-      });
-      let bytes = 0;
-      const bounded = new Transform({
-        transform(chunk: Buffer, _encoding, callback) {
-          const size = Math.min(chunk.length, MAX_OUTPUT_BYTES - bytes);
-          bytes += size;
-          if (size < chunk.length) {
-            stopProcess("failed", "Output exceeded the 20 MiB limit");
-          }
-          callback(null, chunk.subarray(0, size));
+          description: options.description,
+          outputPath: join(directory, "output.log"),
+          resultPath: join(directory, "result.json"),
+          notifyOnCompletion,
+          triggerOnCompletion: notifyOnCompletion && (options.triggerOnCompletion ?? true),
         },
-      });
-      const drained = pipeline(merged, bounded, log.createWriteStream()).catch(
-        (error: unknown) => {
-          stopProcess(
-            "failed",
-            `Could not write task output: ${message(error)}`,
-          );
-          // Keep draining the pipes if the log file is no longer writable.
-          child.stdout.resume();
-          child.stderr.resume();
-          return `Could not write task output: ${message(error)}`;
-        },
+        options,
+        checkAdmission,
+        active,
       );
-      child.stdout.pipe(merged, { end: false });
-      child.stderr.pipe(merged, { end: false });
-      if (timeoutSeconds !== undefined) {
-        timer = setTimeout(
-          () => stopProcess("failed", `Timed out after ${timeoutSeconds}s`),
-          timeoutSeconds * 1000,
-        );
-      }
-
-      const cancel = (reason: string) => {
-        stopProcess("killed", reason);
-        return done;
-      };
-      const done = Promise.all([exited, drained])
-        .then(async ([exit, logError]): Promise<Result> => {
-          const error =
-            stopped?.error ??
-            logError ??
-            spawnError ??
-            (exit.signal
-              ? `Bash exited on ${exit.signal}`
-              : exit.exitCode !== 0
-                ? `Bash exited with code ${exit.exitCode}`
-                : undefined);
-          const result: Result = {
-            ...task,
-            ...exit,
-            status: stopped?.status ?? (error ? "failed" : "completed"),
-            finishedAt: new Date().toISOString(),
-            error,
-          };
-          try {
-            const temporary = `${resultPath}.tmp`;
-            await writeFile(temporary, `${JSON.stringify(result, null, 2)}\n`, {
-              flag: "wx",
-              mode: 0o600,
-            });
-            await rename(temporary, resultPath);
-          } catch (cause) {
-            result.metadataError = `Could not save result: ${message(cause)}`;
-          }
-          return result;
-        })
-        .finally(() => active.delete(id));
-      active.set(id, cancel);
-
-      try {
-        await started;
-      } catch (error) {
-        await done;
-        throw new Error(`Could not start Bash: ${message(error)}`, {
-          cause: error,
-        });
-      }
-      return { task: { ...task, status: "running" as const }, done };
     } catch (error) {
-      await rm(directory, { recursive: true, force: true }).catch(() => {
+      try {
+        await rm(directory, { recursive: true, force: true });
+      } catch {
         // Preserve the original launch error if best-effort cleanup also fails.
-      });
+      }
       throw error;
     }
   }

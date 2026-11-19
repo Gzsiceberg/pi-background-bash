@@ -1,9 +1,7 @@
-import {
-  replaceControlCharacters,
-  stripTerminalSequences,
-} from "@earendil-works/pi-tui";
 import { constants } from "node:fs";
 import { open } from "node:fs/promises";
+
+import { replaceControlCharacters, stripTerminalSequences } from "@earendil-works/pi-tui";
 
 export const LOG_REFRESH_MS = 250;
 
@@ -16,16 +14,9 @@ export interface LogTail {
   clipped: boolean;
 }
 
-export async function readLogTail(
-  path: string,
-  maxBytes: number,
-  maxLines: number,
-): Promise<LogTail> {
+export async function readLogTail(path: string, maxBytes: number, maxLines: number): Promise<LogTail> {
   // The job may replace the log entry. Don't follow a final symlink or block on a FIFO.
-  const file = await open(
-    path,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stat = await file.stat();
     if (!stat.isFile()) {
@@ -44,14 +35,8 @@ export async function readLogTail(
         start++;
       }
     }
-    const text = stripTerminalSequences(
-      buffer.toString("utf8", start, bytesRead),
-    );
-    const lines = text
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .replace(/\n$/, "")
-      .split("\n");
+    const text = stripTerminalSequences(buffer.toString("utf8", start, bytesRead));
+    const lines = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n$/, "").split("\n");
     return {
       lines: lines.slice(-maxLines).map(replaceControlCharacters),
       clipped: offset > 0 || lines.length > maxLines,

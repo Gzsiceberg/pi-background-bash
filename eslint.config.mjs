@@ -1,6 +1,10 @@
 import js from "@eslint/js";
-import prettier from "eslint-config-prettier";
+import stylistic from "@stylistic/eslint-plugin";
 import { defineConfig } from "eslint/config";
+import prettier from "eslint-config-prettier";
+import promise from "eslint-plugin-promise";
+import simpleImportSort from "eslint-plugin-simple-import-sort";
+import sonarjs from "eslint-plugin-sonarjs";
 import globals from "globals";
 import tseslint from "typescript-eslint";
 
@@ -10,20 +14,40 @@ export default defineConfig(
     languageOptions: {
       globals: globals.node,
     },
+    plugins: {
+      "@stylistic": stylistic,
+      promise,
+      "simple-import-sort": simpleImportSort,
+      sonarjs,
+    },
     extends: [js.configs.recommended],
     rules: {
       curly: ["error", "all"],
       eqeqeq: ["error", "always", { null: "ignore" }],
+      "max-depth": ["error", 3],
+      "max-nested-callbacks": ["error", 3],
+      "no-else-return": ["error", { allowElseIf: false }],
+      "no-lonely-if": "error",
+      "no-nested-ternary": "error",
       "object-shorthand": "error",
       "prefer-template": "error",
+      "promise/prefer-await-to-then": "error",
+      "simple-import-sort/exports": "error",
+      "simple-import-sort/imports": "error",
+      "sonarjs/cognitive-complexity": ["error", 15],
+      "sonarjs/no-collapsible-if": "error",
+      "@stylistic/padding-line-between-statements": [
+        "error",
+        { blankLine: "always", prev: "import", next: "*" },
+        { blankLine: "any", prev: "import", next: "import" },
+        { blankLine: "always", prev: "*", next: "function" },
+        { blankLine: "always", prev: "function", next: "*" },
+      ],
     },
   },
   {
     files: ["**/*.ts"],
-    extends: [
-      tseslint.configs.recommendedTypeChecked,
-      tseslint.configs.stylisticTypeChecked,
-    ],
+    extends: [tseslint.configs.recommendedTypeChecked, tseslint.configs.stylisticTypeChecked],
     languageOptions: {
       parserOptions: {
         projectService: true,
@@ -49,6 +73,7 @@ export default defineConfig(
   {
     files: ["src/**/*.ts"],
     rules: {
+      "max-lines-per-function": ["error", { max: 80, skipBlankLines: true, skipComments: true }],
       "no-console": "error",
     },
   },

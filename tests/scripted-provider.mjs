@@ -35,10 +35,7 @@ export default function (pi) {
       const isFirst = ++requests === 1;
       const notification = context.messages.some(
         (message) =>
-          message.role === "user" &&
-          JSON.stringify(message.content).includes(
-            "<background-task-notification>",
-          ),
+          message.role === "user" && JSON.stringify(message.content).includes("<background-task-notification>"),
       );
       const text = notification ? "Fixture follow-up" : "Fixture initial reply";
       const message = {

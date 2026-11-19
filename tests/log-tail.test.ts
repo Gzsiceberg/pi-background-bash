@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+
 import { readLogTail } from "../src/log-tail.ts";
 
 test(
