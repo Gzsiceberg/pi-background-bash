@@ -25,7 +25,7 @@ export default defineConfig(
       curly: ["error", "all"],
       eqeqeq: ["error", "always", { null: "ignore" }],
       "max-depth": ["error", 3],
-      "max-nested-callbacks": ["error", 3],
+      "max-nested-callbacks": ["error", 1],
       "no-else-return": ["error", { allowElseIf: false }],
       "no-lonely-if": "error",
       "no-nested-ternary": "error",

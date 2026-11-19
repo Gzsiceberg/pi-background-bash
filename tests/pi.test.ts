@@ -95,7 +95,7 @@ test("Pi loads bg_run and wakes the model after a background job finishes", posi
   assert.equal(await readFile(outputPath, "utf8"), "fixture live marker\nfixture output\n");
 });
 
-test("Pi registers /bg-tasks but not /bg", posix, async (t) => {
+async function checkRegisteredCommands(t: TestContext) {
   const { lines, send, close } = await openPi(t);
   send({ id: "commands", type: "get_commands" });
   let checked = false;
@@ -116,4 +116,6 @@ test("Pi registers /bg-tasks but not /bg", posix, async (t) => {
     await close();
   }
   assert.ok(checked);
-});
+}
+
+test("Pi registers /bg-tasks but not /bg", posix, checkRegisteredCommands);

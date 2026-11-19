@@ -117,6 +117,10 @@ function registerPanel(pi: ExtensionAPI, { jobs, tasks }: ReturnType<typeof crea
   const listJobs = () =>
     [...jobs.values()].reverse().sort((a, b) => Number(b.status === "running") - Number(a.status === "running"));
 
+  async function stopFromPanel(id: string) {
+    await tasks.stop(id, "Stopped from /bg-tasks");
+  }
+
   pi.registerCommand("bg-tasks", {
     description: "Pick a background job, follow its output, or stop it",
     getArgumentCompletions(prefix) {
@@ -140,17 +144,7 @@ function registerPanel(pi: ExtensionAPI, { jobs, tasks }: ReturnType<typeof crea
         return;
       }
       await ctx.ui.custom<void>(
-        (tui, _theme, keys, done) =>
-          createTaskPanel(
-            tui,
-            keys,
-            done,
-            listJobs,
-            async (id) => {
-              await tasks.stop(id, "Stopped from /bg-tasks");
-            },
-            initialId || undefined,
-          ),
+        (tui, _theme, keys, done) => createTaskPanel(tui, keys, done, listJobs, stopFromPanel, initialId || undefined),
         {
           overlay: true,
           overlayOptions: {
