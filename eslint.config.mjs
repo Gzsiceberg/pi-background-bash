@@ -29,6 +29,14 @@ export default defineConfig(
       "no-else-return": ["error", { allowElseIf: false }],
       "no-lonely-if": "error",
       "no-nested-ternary": "error",
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "SpreadElement > ConditionalExpression",
+          message:
+            "Avoid conditional spreads (...(cond ? [x] : [])); build the array or object with an if statement instead.",
+        },
+      ],
       "object-shorthand": "error",
       "prefer-template": "error",
       "promise/prefer-await-to-then": "error",
@@ -36,6 +44,7 @@ export default defineConfig(
       "simple-import-sort/imports": "error",
       "sonarjs/cognitive-complexity": ["error", 15],
       "sonarjs/no-collapsible-if": "error",
+      "sonarjs/no-nested-template-literals": "error",
       "@stylistic/padding-line-between-statements": [
         "error",
         { blankLine: "always", prev: "import", next: "*" },

@@ -248,14 +248,18 @@ class TaskPanel implements Component {
     if (this.confirmId) {
       return "Stop job? y stop · Esc/n cancel";
     }
-    return [
-      "Esc close",
-      ...(this.tasks.length > 1 ? ["↑/↓ jobs"] : []),
-      ...(this.canStop(task) ? ["x stop"] : []),
-      "p path",
-      "PgUp/PgDn scroll",
-      ...(this.scrollBack !== undefined ? ["End resume"] : []),
-    ].join(" · ");
+    const hints = ["Esc close"];
+    if (this.tasks.length > 1) {
+      hints.push("↑/↓ jobs");
+    }
+    if (this.canStop(task)) {
+      hints.push("x stop");
+    }
+    hints.push("p path", "PgUp/PgDn scroll");
+    if (this.scrollBack !== undefined) {
+      hints.push("End resume");
+    }
+    return hints.join(" · ");
   }
 
   private renderPreview(task: PanelTask, rows: number) {

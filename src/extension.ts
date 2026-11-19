@@ -84,23 +84,30 @@ function createSession(pi: ExtensionAPI) {
 type TaskCompletion = Awaited<ReturnType<ReturnType<typeof createTasks>["run"]>>["done"];
 
 function sendCompletion(pi: ExtensionAPI, ctx: ExtensionContext, result: Awaited<TaskCompletion>) {
+  const lines = [
+    `<${notificationType}>`,
+    `${quote(result.name)} ${result.status}${
+      result.exitCode == null || result.exitCode === 0 ? "" : ` · exit ${result.exitCode}`
+    } · ${formatDuration(result.startedAt, result.finishedAt)}`,
+    `Task ID: ${result.id}`,
+  ];
+  if (result.error) {
+    lines.push(`Error: ${quote(result.error)}`);
+  }
+  if (ctx.mode === "tui") {
+    lines.push(`View: /bg-tasks ${result.id}`);
+  }
+  lines.push(
+    `Output: ${quote(result.outputPath)}`,
+    result.metadataError ? quote(result.metadataError) : `Result: ${quote(result.resultPath)}`,
+    `</${notificationType}>`,
+  );
   pi.sendMessage(
     {
       customType: notificationType,
       display: true,
       details: { task: result },
-      content: [
-        `<${notificationType}>`,
-        `${quote(result.name)} ${result.status}${
-          result.exitCode == null || result.exitCode === 0 ? "" : ` · exit ${result.exitCode}`
-        } · ${formatDuration(result.startedAt, result.finishedAt)}`,
-        `Task ID: ${result.id}`,
-        ...(result.error ? [`Error: ${quote(result.error)}`] : []),
-        ...(ctx.mode === "tui" ? [`View: /bg-tasks ${result.id}`] : []),
-        `Output: ${quote(result.outputPath)}`,
-        result.metadataError ? quote(result.metadataError) : `Result: ${quote(result.resultPath)}`,
-        `</${notificationType}>`,
-      ].join("\n"),
+      content: lines.join("\n"),
     },
     { deliverAs: "followUp", triggerTurn: result.triggerOnCompletion },
   );
