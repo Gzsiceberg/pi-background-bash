@@ -18,7 +18,7 @@ Ask Pi: “Run `npm test` in the background and tell me when it finishes.” Pi 
 
 - Open `/bg-tasks` to see job status and output. Use **↑/↓** to select a job and **Esc** to close the panel.
 - To stop a running job, select it and press **x**, then **y** to confirm.
-- Full output is saved under `.pi/tasks/` in the working directory. Running jobs stop when the Pi session ends.
+- Each job has a short ID, such as `b1a9a24d`. Open it directly with `/bg-tasks b1a9a24d`. Full output is saved under `.pi/tasks/<id>/` in the working directory. Running jobs stop when the Pi session ends.
 
 ## License
 

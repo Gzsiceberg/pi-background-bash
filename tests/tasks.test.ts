@@ -27,6 +27,9 @@ test("returns before the command ends and captures Bash stdout and stderr in the
     timeoutSeconds: 4,
   });
   assert.equal(task.status, "running");
+  assert.match(task.id, /^[0-9a-f]{8}$/);
+  assert.equal(task.outputPath, join(root, task.id, "output.log"));
+  assert.equal(task.resultPath, join(root, task.id, "result.json"));
   assert.ok(task.pid);
   assert.equal(task.triggerOnCompletion, true);
   await assert.rejects(access(task.resultPath), { code: "ENOENT" });

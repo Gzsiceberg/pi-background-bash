@@ -1,5 +1,5 @@
 import { type ChildProcessByStdio, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { type FileHandle, mkdir, open, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -235,6 +235,23 @@ class TaskProcess {
   }
 }
 
+async function createTaskDirectory(root: string) {
+  await mkdir(root, { recursive: true, mode: 0o700 });
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const id = randomBytes(4).toString("hex");
+    const directory = join(root, id);
+    try {
+      await mkdir(directory, { mode: 0o700 });
+      return { id, directory };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
+    }
+  }
+  throw new Error("Could not allocate a unique background task ID");
+}
+
 export function createTasks() {
   let closed = false;
   const active = new Map<string, Cancel>();
@@ -248,10 +265,7 @@ export function createTasks() {
     };
     checkAdmission();
     const name = validate(options);
-    const id = randomUUID();
-    await mkdir(taskRoot, { recursive: true, mode: 0o700 });
-    const directory = join(taskRoot, id);
-    await mkdir(directory, { mode: 0o700 });
+    const { id, directory } = await createTaskDirectory(taskRoot);
     const notifyOnCompletion = options.notifyOnCompletion ?? true;
     try {
       return await startProcess(
