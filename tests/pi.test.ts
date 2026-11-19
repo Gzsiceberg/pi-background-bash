@@ -49,10 +49,10 @@ async function openPi(t: TestContext) {
   return {
     cwd,
     lines,
-    send(command: object) {
+    send(this: void, command: object) {
       child.stdin.write(`${JSON.stringify(command)}\n`);
     },
-    async close() {
+    async close(this: void) {
       child.stdin.end();
       await closed;
       t.signal.removeEventListener("abort", abort);

@@ -120,7 +120,7 @@ export function createTasks() {
       let terminal = false;
       let stopped: { status: "failed" | "killed"; error: string } | undefined;
       let closePipes: NodeJS.Timeout | undefined;
-      function stop(status: "failed" | "killed", error: string) {
+      function stopProcess(status: "failed" | "killed", error: string) {
         if (stopped || (terminal && status === "killed")) {
           return;
         }
@@ -159,12 +159,12 @@ export function createTasks() {
         exitCode: number | null;
         signal: NodeJS.Signals | null;
       }>((resolve) => {
-        child.once("close", (exitCode, signal) => {
+        child.once("close", (exitCode, exitSignal) => {
           terminal = true;
           clearTimeout(timer);
           clearTimeout(closePipes);
           merged.end();
-          resolve({ exitCode, signal });
+          resolve({ exitCode, signal: exitSignal });
         });
       });
       let bytes = 0;
@@ -173,14 +173,17 @@ export function createTasks() {
           const size = Math.min(chunk.length, MAX_OUTPUT_BYTES - bytes);
           bytes += size;
           if (size < chunk.length) {
-            stop("failed", "Output exceeded the 20 MiB limit");
+            stopProcess("failed", "Output exceeded the 20 MiB limit");
           }
           callback(null, chunk.subarray(0, size));
         },
       });
       const drained = pipeline(merged, bounded, log.createWriteStream()).catch(
         (error: unknown) => {
-          stop("failed", `Could not write task output: ${message(error)}`);
+          stopProcess(
+            "failed",
+            `Could not write task output: ${message(error)}`,
+          );
           // Keep draining the pipes if the log file is no longer writable.
           child.stdout.resume();
           child.stderr.resume();
@@ -191,13 +194,13 @@ export function createTasks() {
       child.stderr.pipe(merged, { end: false });
       if (timeoutSeconds !== undefined) {
         timer = setTimeout(
-          () => stop("failed", `Timed out after ${timeoutSeconds}s`),
+          () => stopProcess("failed", `Timed out after ${timeoutSeconds}s`),
           timeoutSeconds * 1000,
         );
       }
 
       const cancel = (reason: string) => {
-        stop("killed", reason);
+        stopProcess("killed", reason);
         return done;
       };
       const done = Promise.all([exited, drained])
@@ -243,7 +246,9 @@ export function createTasks() {
       }
       return { task: { ...task, status: "running" as const }, done };
     } catch (error) {
-      await rm(directory, { recursive: true, force: true }).catch(() => {});
+      await rm(directory, { recursive: true, force: true }).catch(() => {
+        // Preserve the original launch error if best-effort cleanup also fails.
+      });
       throw error;
     }
   }

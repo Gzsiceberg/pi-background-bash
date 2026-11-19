@@ -18,7 +18,7 @@ Tested with Pi 1.5.2 on macOS. The runtime requires a POSIX host with `bash` on 
 Ask Pi to run a command in the background, for example: “Run `npm test` in the background and tell me when it finishes.” The `bg_run` tool call would look like:
 
 ```json
-{"name":"Run project tests","command":"npm test","timeoutSeconds":300}
+{ "name": "Run project tests", "command": "npm test", "timeoutSeconds": 300 }
 ```
 
 `name` and `command` are required. `description` and `timeoutSeconds` are optional. Omitting the timeout lets the job run until it finishes or the Pi session ends.

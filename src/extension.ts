@@ -74,11 +74,11 @@ export default function (pi: ExtensionAPI) {
             details: { task: result },
             content: [
               `<${notificationType}>`,
-              `${quote(result.name)} ${result.status}` +
-                (result.exitCode == null || result.exitCode === 0
+              `${quote(result.name)} ${result.status}${
+                result.exitCode == null || result.exitCode === 0
                   ? ""
-                  : ` · exit ${result.exitCode}`) +
-                ` · ${formatDuration(result.startedAt, result.finishedAt)}`,
+                  : ` · exit ${result.exitCode}`
+              } · ${formatDuration(result.startedAt, result.finishedAt)}`,
               `Task ID: ${result.id}`,
               ...(result.error ? [`Error: ${quote(result.error)}`] : []),
               ...(ctx.mode === "tui" ? [`View: /bg-tasks ${result.id}`] : []),

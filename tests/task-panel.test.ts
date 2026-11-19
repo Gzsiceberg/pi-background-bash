@@ -46,7 +46,7 @@ test(
     let closed = false;
     const terminal = { rows: 24 };
     const stopped: string[] = [];
-    let finishStop: () => void = () => {};
+    let finishStop: (() => void) | undefined;
     const keys = {
       matches(data: string, binding: string) {
         if (binding === "tui.select.up") {
@@ -104,7 +104,7 @@ test(
     assert.match(display(), /… new output/);
     assert.match(display(), /Esc close/);
     terminal.rows = 24;
-    await appendFile(running.outputPath, "line\n".repeat(13) + "last line\n");
+    await appendFile(running.outputPath, `${"line\n".repeat(13)}last line\n`);
     await until(() => display().includes("last line"));
     assert.match(display(), /LIVE · Output clipped/);
     assert.doesNotMatch(display(), /first line/);
@@ -132,6 +132,7 @@ test(
         error: "Stopped from /bg-tasks",
       },
     ];
+    assert.ok(finishStop);
     finishStop();
     await until(() => /› \[killed\].*Live build/.test(display()));
     assert.doesNotMatch(display(), /Stopped from \/bg-tasks/);
@@ -188,12 +189,14 @@ test(
         terminal: { rows: 24 } as Parameters<
           typeof createTaskPanel
         >[0]["terminal"],
-        requestRender() {},
+        requestRender() {
+          // This test renders explicitly when inspecting the panel.
+        },
       },
       { matches: () => false },
       () => assert.fail("Panel closed"),
       () => jobs,
-      async () => assert.fail("Unexpected stop"),
+      () => Promise.reject(new Error("Unexpected stop")),
       "chosen",
     );
     t.after(() => panel.dispose());

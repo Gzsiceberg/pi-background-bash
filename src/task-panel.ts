@@ -92,14 +92,14 @@ export function createTaskPanel(
         TAIL_LINES,
       ).catch(() => ({ lines: ["(output log unavailable)"], clipped: false }));
       if (!disposed && task === current() && scrollBack === undefined) {
-        const changed =
+        const previewChanged =
           task !== loaded ||
           preview.clipped !== tail.clipped ||
           preview.lines.length !== tail.lines.length ||
           preview.lines.some((line, i) => line !== tail.lines[i]);
         loaded = task;
         preview = tail;
-        if (changed) {
+        if (previewChanged) {
           tui.requestRender();
         }
       }
@@ -211,7 +211,8 @@ export function createTaskPanel(
         const maxBack = Math.max(0, lines.length - previewRows);
         const start = maxBack - Math.min(maxBack, scrollBack ?? 0);
         const end = Math.min(lines.length, start + previewRows);
-        const clipped = tail?.clipped || start > 0 || end < lines.length;
+        const clipped =
+          (tail?.clipped ?? false) || start > 0 || end < lines.length;
         if (logRows > 1) {
           body.push(`${mode}${clipped ? " · Output clipped" : ""}`);
           body.push(...lines.slice(start, end));
@@ -330,7 +331,9 @@ export function createTaskPanel(
       tui.requestRender();
       void refresh();
     },
-    invalidate() {},
+    invalidate() {
+      // Rendering reads the current terminal dimensions; there is no layout cache.
+    },
     dispose() {
       disposed = true;
       clearInterval(timer);
