@@ -22,11 +22,18 @@ export interface PanelTask {
   id: string;
   name: string;
   outputPath: string;
-  status: "running" | "completed" | "failed" | "killed";
+  status: "queued" | "running" | "completed" | "failed" | "killed";
+  queuedAt?: string;
   startedAt?: string;
   finishedAt?: string;
+  after?: string[];
+  afterNames?: Record<string, string>;
   error?: string;
   exitCode?: number | null;
+}
+
+function isStoppableStatus(status: PanelTask["status"] | undefined): boolean {
+  return status === "running" || status === "queued";
 }
 
 export type PanelTheme = Pick<Theme, "fg" | "bg" | "bold">;
@@ -188,7 +195,7 @@ class TaskPanel implements Component {
     if (!this.current()) {
       this.select(next[0]?.id);
     }
-    if (this.current()?.status !== "running") {
+    if (!isStoppableStatus(this.current()?.status)) {
       this.confirmId = undefined;
     }
     this.tui.requestRender();
@@ -209,6 +216,10 @@ class TaskPanel implements Component {
     this.updateTasks();
     this.tickSpinner();
     const task = this.current();
+    if (task?.status === "queued") {
+      this.loaded = undefined;
+      return;
+    }
     if (
       this.reading ||
       !task ||
@@ -291,7 +302,15 @@ class TaskPanel implements Component {
 
   private jobsTitle(task: PanelTask): string {
     const running = this.tasks.filter((job) => job.status === "running").length;
-    const summary = running > 0 ? `${running} running` : `${this.tasks.length} finished`;
+    const queued = this.tasks.filter((job) => job.status === "queued").length;
+    const activeParts: string[] = [];
+    if (running > 0) {
+      activeParts.push(`${running} running`);
+    }
+    if (queued > 0) {
+      activeParts.push(`${queued} queued`);
+    }
+    const summary = activeParts.length > 0 ? activeParts.join(", ") : `${this.tasks.length} finished`;
     const parts = [this.theme.bold(this.theme.fg("toolTitle", "Background Tasks")), this.theme.fg("muted", summary)];
     if (this.tasks.length > MAX_JOB_ROWS) {
       parts.push(this.theme.fg("dim", `${this.tasks.indexOf(task) + 1}/${this.tasks.length}`));
@@ -334,7 +353,7 @@ class TaskPanel implements Component {
   }
 
   private canStop(task: PanelTask) {
-    return task.status === "running" && !this.stopping.has(task.id);
+    return isStoppableStatus(task.status) && !this.stopping.has(task.id);
   }
 
   private statusGlyph(job: PanelTask): string {
@@ -342,6 +361,9 @@ class TaskPanel implements Component {
       return this.stopping.has(job.id)
         ? this.theme.fg("warning", "◌")
         : this.theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame]);
+    }
+    if (job.status === "queued") {
+      return this.stopping.has(job.id) ? this.theme.fg("warning", "◌") : this.theme.fg("muted", "◷");
     }
     if (job.status === "completed") {
       return this.theme.fg("success", "✓");
@@ -352,7 +374,33 @@ class TaskPanel implements Component {
     return this.theme.fg("muted", "■");
   }
 
+  private dependencyLabel(job: PanelTask, id: string, maxNameWidth?: number): string {
+    const rawName = job.afterNames?.[id] ?? this.tasks.find((item) => item.id === id)?.name;
+    if (!rawName) {
+      return id;
+    }
+    const clean = plainText(rawName);
+    const label = maxNameWidth === undefined ? clean : truncateToWidth(clean, maxNameWidth, "…");
+    return `${label} (${id})`;
+  }
+
+  private queuedMeta(job: PanelTask): string {
+    if (this.stopping.has(job.id)) {
+      return this.theme.fg("warning", "stopping");
+    }
+    if (job.after?.length === 1) {
+      return this.theme.fg("muted", `after ${this.dependencyLabel(job, job.after[0], 24)}`);
+    }
+    if (job.after && job.after.length > 1) {
+      return this.theme.fg("muted", `after ${job.after.length} tasks`);
+    }
+    return this.theme.fg("muted", "queued");
+  }
+
   private jobMeta(job: PanelTask): string {
+    if (job.status === "queued") {
+      return this.queuedMeta(job);
+    }
     const parts: string[] = [];
     if (job.status === "running" && this.stopping.has(job.id)) {
       parts.push(this.theme.fg("warning", "stopping"));
@@ -439,14 +487,31 @@ class TaskPanel implements Component {
     return joinHints(this.theme, hints);
   }
 
-  private modeBadge(live: boolean): string {
+  private modeBadge(task: PanelTask): string {
     if (this.scrollBack !== undefined) {
       return this.theme.bold(this.theme.fg("warning", "⏸ PAUSED"));
     }
-    if (live) {
+    if (task.status === "running") {
       return this.theme.bold(this.theme.fg("accent", `${SPINNER_FRAMES[this.spinnerFrame]} LIVE`));
     }
+    if (task.status === "queued") {
+      return this.theme.fg("muted", "◷ QUEUED");
+    }
     return this.theme.fg("muted", "FINAL");
+  }
+
+  private previewFallback(task: PanelTask): string {
+    if (task.status === "running") {
+      return "(waiting for output)";
+    }
+    if (task.status === "queued") {
+      if (!task.after?.length) {
+        return "(queued)";
+      }
+      const deps = task.after.map((id) => this.dependencyLabel(task, id)).join(", ");
+      return `(waiting for ${deps} to finish)`;
+    }
+    return "(no output)";
   }
 
   private scrollMeta(tail: LogTail | undefined, start: number, end: number, total: number): string {
@@ -467,11 +532,10 @@ class TaskPanel implements Component {
     if (rows <= 0) {
       return [];
     }
-    const live = task.status === "running";
-    const badge = this.modeBadge(live);
+    const badge = this.modeBadge(task);
     const tail = this.loaded?.id === task.id ? this.preview : undefined;
     const hasOutput = Boolean(tail?.lines.length);
-    const fallback = live ? "(waiting for output)" : "(no output)";
+    const fallback = this.previewFallback(task);
     const lines = hasOutput ? tail!.lines : [fallback];
     const maxBack = Math.max(0, lines.length - this.previewRows);
     const start = maxBack - Math.min(maxBack, this.scrollBack ?? 0);

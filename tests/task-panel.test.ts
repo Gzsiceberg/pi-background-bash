@@ -340,6 +340,92 @@ async function checkMouseWheelAndClick(t: TestContext) {
   assert.match(display(), /› ✓ Second job/);
 }
 
+async function checkQueuedTaskDisplayAndStop(t: TestContext) {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-bg-queued-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const runningLog = join(cwd, "running.log");
+  const queuedLog = join(cwd, "queued.log");
+  await writeFile(runningLog, "upstream running\n");
+  let jobs: PanelTask[] = [
+    { id: "up01", name: "Upstream job", outputPath: runningLog, status: "running" },
+    {
+      id: "down02",
+      name: "Downstream job",
+      outputPath: queuedLog,
+      status: "queued",
+      queuedAt: "2026-01-01T00:00:00.000Z",
+      after: ["up01"],
+    },
+  ];
+  const stopped: string[] = [];
+  const panel = createTaskPanel(
+    {
+      terminal: { rows: 24 } as Parameters<typeof createTaskPanel>[0]["terminal"],
+      requestRender() {
+        // Explicit rendering below.
+      },
+    },
+    { matches: () => false },
+    () => assert.fail("Panel closed"),
+    () => jobs,
+    async (id) => {
+      stopped.push(id);
+      await Promise.resolve();
+    },
+    "down02",
+  );
+  t.after(() => panel.dispose());
+  const display = () => panel.render(80).join("\n");
+  await until(() => display().includes("QUEUED"));
+  assert.match(display(), /Background Tasks · 1 running, 1 queued/);
+  assert.match(display(), /› ◷ Downstream job.*after Upstream job \(up01\)/);
+  assert.match(display(), /◷ QUEUED/);
+  assert.match(display(), /\(waiting for Upstream job \(up01\) to finish\)/);
+  assert.match(display(), /x stop/);
+
+  // Falls back to afterNames when an upstream task is not in the visible job list.
+  jobs = [
+    {
+      ...jobs[1],
+      after: ["up01", "old00"],
+      afterNames: { up01: "Upstream job", old00: "Evicted job" },
+    },
+  ];
+  await until(() => display().includes("Evicted job (old00)"));
+  assert.match(display(), /› ◷ Downstream job.*after 2 tasks/);
+  assert.match(display(), /\(waiting for Upstream job \(up01\), Evicted job \(old00\) to finish\)/);
+  jobs = [
+    { id: "up01", name: "Upstream job", outputPath: runningLog, status: "running" },
+    {
+      id: "down02",
+      name: "Downstream job",
+      outputPath: queuedLog,
+      status: "queued",
+      queuedAt: "2026-01-01T00:00:00.000Z",
+      after: ["up01"],
+    },
+  ];
+  await until(() => display().includes("1 running, 1 queued"));
+
+  // Can stop a queued task.
+  panel.handleInput?.("x");
+  panel.handleInput?.("y");
+  assert.deepEqual(stopped, ["down02"]);
+
+  // Transitions cleanly to LIVE output once queued task starts running.
+  await writeFile(queuedLog, "downstream started\n");
+  jobs = [
+    jobs[0],
+    {
+      ...jobs[1],
+      status: "running",
+      startedAt: new Date().toISOString(),
+    },
+  ];
+  await until(() => display().includes("downstream started"));
+  assert.match(display(), /LIVE/);
+}
+
 test("task panel marks clipped output and confirms stopping only the selected live job", posix, checkClippingAndStop);
 test("opens a job by ID, freezes scrollback, and shows its full log path", posix, checkScrollbackAndPath);
 test(
@@ -348,3 +434,8 @@ test(
   checkThemeTallPreviewAndOverflow,
 );
 test("supports mouse wheel scrolling and clicking to select jobs", posix, checkMouseWheelAndClick);
+test(
+  "shows queued DAG tasks, allows stopping them, and switches to LIVE when started",
+  posix,
+  checkQueuedTaskDisplayAndStop,
+);

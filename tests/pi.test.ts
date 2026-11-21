@@ -79,7 +79,7 @@ test("Pi loads bg_run and wakes the model after a background job finishes", posi
       if (event.type === "message_end" && event.message.customType === "background-task-notification") {
         assert.equal(notified, false);
         assert.equal(event.message.details.task.status, "completed");
-        assert.match(event.message.content.split("\n")[1], /^".+" completed · \d+s$/);
+        assert.match(event.message.content.split("\n")[1], /^✓ .+ \([0-9a-f]{8}\) · completed · \d+s$/);
         assert.doesNotMatch(event.message.content, /fixture (live marker|output)/);
         outputPath = event.message.details.task.outputPath;
         notified = true;
@@ -117,5 +117,36 @@ async function checkRegisteredCommands(t: TestContext) {
   }
   assert.ok(checked);
 }
+
+test("Pi loads bg_run_dag, runs downstream after upstream failure, and wakes on completion", posix, async (t) => {
+  const { cwd, lines, send, close } = await openPi(t);
+  send({ id: "prompt", type: "prompt", message: "Run the fixture DAG" });
+  let notifiedTask: { name: string; status: string; after?: string[] } | undefined;
+  let notificationContent: string | undefined;
+  try {
+    for await (const line of lines) {
+      const event = JSON.parse(line);
+      const text = JSON.stringify(event);
+      if (event.type === "response" && event.id === "prompt") {
+        assert.equal(event.success, true, text);
+      }
+      if (event.type === "message_end" && event.message.customType === "background-task-notification") {
+        notifiedTask = event.message.details.task;
+        notificationContent = event.message.content;
+      }
+      if (event.type === "agent_end" && text.includes("Fixture follow-up")) {
+        break;
+      }
+    }
+  } finally {
+    await close();
+  }
+  assert.ok(notifiedTask);
+  assert.equal(notifiedTask.name, "DAG step 2");
+  assert.equal(notifiedTask.status, "completed");
+  assert.equal(notifiedTask.after?.length, 1);
+  assert.match(notificationContent ?? "", new RegExp(`After:  DAG step 1 \\(${notifiedTask.after[0]}\\)`));
+  assert.equal(await readFile(join(cwd, "dag.log"), "utf8"), "step1\nstep2\n");
+});
 
 test("Pi registers /bg-tasks but not /bg", posix, checkRegisteredCommands);

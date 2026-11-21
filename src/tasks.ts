@@ -6,6 +6,8 @@ import { join } from "node:path";
 import { PassThrough, type Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
+import { normalizeAfter, orderDagItems } from "./dag.ts";
+
 export const MAX_OUTPUT_BYTES = 20 * 1024 * 1024;
 export const MAX_TIMEOUT_SECONDS = 2_147_483;
 
@@ -16,9 +18,14 @@ export interface RunOptions {
   timeoutSeconds?: number;
   notifyOnCompletion?: boolean;
   triggerOnCompletion?: boolean;
+  after?: string[];
 }
 
-interface Task {
+export interface DagNodeOptions extends RunOptions {
+  key: string;
+}
+
+interface TaskBase {
   id: string;
   name: string;
   description?: string;
@@ -26,17 +33,32 @@ interface Task {
   cwd: string;
   outputPath: string;
   resultPath: string;
-  startedAt: string;
+  queuedAt?: string;
+  startedAt?: string;
+  after?: string[];
   notifyOnCompletion: boolean;
   triggerOnCompletion: boolean;
 }
+
+export type RunningTask = TaskBase & {
+  status: "running";
+  startedAt: string;
+};
+
+export type QueuedTask = TaskBase & {
+  status: "queued";
+  queuedAt: string;
+  after: string[];
+};
+
+export type LiveTask = RunningTask | QueuedTask;
 
 interface Exit {
   exitCode: number | null;
   signal: NodeJS.Signals | null;
 }
 
-export type Result = Task &
+export type Result = TaskBase &
   Exit & {
     status: "completed" | "failed" | "killed";
     finishedAt: string;
@@ -44,12 +66,26 @@ export type Result = Task &
     metadataError?: string;
   };
 
+export interface TaskHandle {
+  task: LiveTask;
+  started: Promise<RunningTask | undefined>;
+  done: Promise<Result>;
+}
+
+export interface DagTaskHandle extends TaskHandle {
+  key: string;
+}
+
 type Child = ChildProcessByStdio<null, Readable, Readable>;
 interface StopReason {
   status: "failed" | "killed";
   error: string;
 }
 type Cancel = (reason: string) => Promise<Result>;
+interface TrackedTask {
+  done: Promise<Result>;
+  settled: boolean;
+}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -77,7 +113,7 @@ function validate(options: RunOptions) {
 }
 
 async function startProcess(
-  task: Omit<Task, "pid" | "startedAt">,
+  task: Omit<TaskBase, "pid" | "startedAt">,
   options: RunOptions,
   checkAdmission: () => void,
   active: Map<string, Cancel>,
@@ -129,9 +165,9 @@ class TaskProcess {
   private readonly started: Promise<unknown>;
 
   private readonly child: Child;
-  readonly task: Task;
+  readonly task: TaskBase & { startedAt: string };
 
-  constructor(child: Child, task: Task, log: FileHandle) {
+  constructor(child: Child, task: TaskBase & { startedAt: string }, log: FileHandle) {
     this.child = child;
     this.task = task;
     child.on("error", (error) => {
@@ -215,7 +251,8 @@ class TaskProcess {
       await done;
       throw new Error(`Could not start Bash: ${message(error)}`, { cause: error });
     }
-    return { task: { ...this.task, status: "running" as const }, done };
+    const task: RunningTask = { ...this.task, status: "running" };
+    return { task, started: Promise.resolve(task), done };
   }
 
   private async finish(active: Map<string, Cancel>): Promise<Result> {
@@ -235,6 +272,78 @@ class TaskProcess {
   }
 }
 
+function unstartedResult(
+  task: Omit<TaskBase, "pid" | "startedAt">,
+  status: "failed" | "killed",
+  error: string,
+): Promise<Result> {
+  return saveResult({
+    ...task,
+    pid: undefined,
+    exitCode: null,
+    signal: null,
+    status,
+    finishedAt: new Date().toISOString(),
+    error,
+  });
+}
+
+function createQueuedTask(
+  task: Omit<TaskBase, "pid" | "startedAt"> & { queuedAt: string; after: string[] },
+  options: RunOptions,
+  waitFor: Promise<Result>[],
+  active: Map<string, Cancel>,
+  getShutdownReason: () => string | undefined,
+): TaskHandle {
+  let cancelReason: string | undefined;
+  let triggerCancel: (() => void) | undefined;
+  const cancelled = new Promise<void>((resolve) => {
+    triggerCancel = resolve;
+  });
+  let resolveStarted!: (running: RunningTask | undefined) => void;
+  const started = new Promise<RunningTask | undefined>((resolve) => {
+    resolveStarted = resolve;
+  });
+
+  const checkQueuedAdmission = () => {
+    const stopReason = cancelReason ?? getShutdownReason();
+    if (stopReason !== undefined) {
+      throw new Error(stopReason);
+    }
+  };
+
+  const runAfterDeps = async (): Promise<Result> => {
+    await Promise.race([Promise.all(waitFor), cancelled]);
+    const stopReason = cancelReason ?? getShutdownReason();
+    if (stopReason !== undefined) {
+      active.delete(task.id);
+      resolveStarted(undefined);
+      return unstartedResult(task, "killed", stopReason);
+    }
+    try {
+      const running = await startProcess(task, options, checkQueuedAdmission, active);
+      resolveStarted(running.task);
+      return await running.done;
+    } catch (error) {
+      active.delete(task.id);
+      resolveStarted(undefined);
+      const lateStop = cancelReason ?? getShutdownReason();
+      return unstartedResult(task, lateStop === undefined ? "failed" : "killed", lateStop ?? message(error));
+    }
+  };
+
+  const done = runAfterDeps();
+  active.set(task.id, (reason) => {
+    if (cancelReason === undefined) {
+      cancelReason = reason;
+      triggerCancel?.();
+    }
+    return done;
+  });
+
+  return { task: { ...task, pid: undefined, status: "queued" }, started, done };
+}
+
 async function createTaskDirectory(root: string) {
   await mkdir(root, { recursive: true, mode: 0o700 });
   for (let attempt = 0; attempt < 10; attempt++) {
@@ -252,43 +361,140 @@ async function createTaskDirectory(root: string) {
   throw new Error("Could not allocate a unique background task ID");
 }
 
-export function createTasks() {
-  let closed = false;
-  const active = new Map<string, Cancel>();
+async function settleTask(done: Promise<Result>, entry: TrackedTask): Promise<Result> {
+  try {
+    return await done;
+  } finally {
+    entry.settled = true;
+  }
+}
 
-  async function run(cwd: string, taskRoot: string, options: RunOptions, signal?: AbortSignal) {
-    const checkAdmission = () => {
-      signal?.throwIfAborted();
-      if (closed) {
-        throw new Error("Pi is shutting down this bg_run session");
-      }
-    };
-    checkAdmission();
-    const name = validate(options);
-    const { id, directory } = await createTaskDirectory(taskRoot);
-    const notifyOnCompletion = options.notifyOnCompletion ?? true;
+function resolveDependencies(after: string[], known: Map<string, TrackedTask>) {
+  const waitFor: Promise<Result>[] = [];
+  for (const depId of after) {
+    const dep = known.get(depId);
+    if (!dep) {
+      throw new Error(`Unknown dependency task ID: ${depId}`);
+    }
+    if (!dep.settled) {
+      waitFor.push(dep.done);
+    }
+  }
+  return waitFor;
+}
+
+function trackKnown(handle: TaskHandle, known: Map<string, TrackedTask>): TaskHandle {
+  const entry: TrackedTask = { done: handle.done, settled: false };
+  entry.done = settleTask(handle.done, entry);
+  known.set(handle.task.id, entry);
+  return { task: handle.task, started: handle.started, done: entry.done };
+}
+
+interface LaunchContext {
+  active: Map<string, Cancel>;
+  known: Map<string, TrackedTask>;
+  getShutdownReason: () => string | undefined;
+  checkAdmission: (signal?: AbortSignal) => void;
+}
+
+async function launchTask(
+  context: LaunchContext,
+  cwd: string,
+  taskRoot: string,
+  name: string,
+  options: RunOptions,
+  after: string[],
+  signal?: AbortSignal,
+): Promise<TaskHandle> {
+  const admit = () => context.checkAdmission(signal);
+  admit();
+  const waitFor = resolveDependencies(after, context.known);
+  const { id, directory } = await createTaskDirectory(taskRoot);
+  const notifyOnCompletion = options.notifyOnCompletion ?? true;
+  const base: Omit<TaskBase, "pid" | "startedAt"> = {
+    id,
+    name,
+    cwd,
+    description: options.description,
+    outputPath: join(directory, "output.log"),
+    resultPath: join(directory, "result.json"),
+    after: after.length > 0 ? after : undefined,
+    notifyOnCompletion,
+    triggerOnCompletion: notifyOnCompletion && (options.triggerOnCompletion ?? true),
+  };
+  if (waitFor.length > 0) {
+    const queued = createQueuedTask(
+      { ...base, queuedAt: new Date().toISOString(), after },
+      options,
+      waitFor,
+      context.active,
+      context.getShutdownReason,
+    );
+    return trackKnown(queued, context.known);
+  }
+  try {
+    const started = await startProcess(base, options, admit, context.active);
+    return trackKnown(started, context.known);
+  } catch (error) {
     try {
-      return await startProcess(
-        {
-          id,
-          name,
-          cwd,
-          description: options.description,
-          outputPath: join(directory, "output.log"),
-          resultPath: join(directory, "result.json"),
-          notifyOnCompletion,
-          triggerOnCompletion: notifyOnCompletion && (options.triggerOnCompletion ?? true),
-        },
-        options,
-        checkAdmission,
-        active,
-      );
-    } catch (error) {
-      try {
-        await rm(directory, { recursive: true, force: true });
-      } catch {
-        // Preserve the original launch error if best-effort cleanup also fails.
+      await rm(directory, { recursive: true, force: true });
+    } catch {
+      // Preserve the original launch error if best-effort cleanup also fails.
+    }
+    throw error;
+  }
+}
+
+export function createTasks() {
+  let shutdownReason: string | undefined;
+  const active = new Map<string, Cancel>();
+  const known = new Map<string, TrackedTask>();
+
+  function checkAdmission(signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    if (shutdownReason !== undefined) {
+      throw new Error("Pi is shutting down this bg_run session");
+    }
+  }
+
+  const context: LaunchContext = {
+    active,
+    known,
+    getShutdownReason: () => shutdownReason,
+    checkAdmission,
+  };
+
+  async function run(cwd: string, taskRoot: string, options: RunOptions, signal?: AbortSignal): Promise<TaskHandle> {
+    checkAdmission(signal);
+    const name = validate(options);
+    const after = normalizeAfter(options.after);
+    return launchTask(context, cwd, taskRoot, name, options, after, signal);
+  }
+
+  async function runDag(
+    cwd: string,
+    taskRoot: string,
+    nodes: readonly DagNodeOptions[],
+    signal?: AbortSignal,
+  ): Promise<DagTaskHandle[]> {
+    checkAdmission(signal);
+    const ordered = orderDagItems(nodes, (id) => known.has(id));
+    const names = ordered.map((item) => validate(item.node));
+    const keyToId = new Map<string, string>();
+    const created: DagTaskHandle[] = [];
+    const results = new Array<DagTaskHandle>(nodes.length);
+    try {
+      for (const [position, item] of ordered.entries()) {
+        const after = normalizeAfter(item.after.map((dep) => keyToId.get(dep) ?? dep));
+        const handle = await launchTask(context, cwd, taskRoot, names[position], item.node, after, signal);
+        const dagHandle: DagTaskHandle = { key: item.key, ...handle };
+        keyToId.set(item.key, handle.task.id);
+        created.push(dagHandle);
+        results[item.index] = dagHandle;
       }
+      return results;
+    } catch (error) {
+      await Promise.all(created.map((item) => stop(item.task.id, "Aborted DAG launch")));
       throw error;
     }
   }
@@ -298,9 +504,9 @@ export function createTasks() {
   }
 
   async function shutdown(reason: string) {
-    closed = true;
+    shutdownReason = reason;
     await Promise.all([...active.values()].map((cancel) => cancel(reason)));
   }
 
-  return { run, stop, shutdown };
+  return { run, runDag, stop, shutdown };
 }

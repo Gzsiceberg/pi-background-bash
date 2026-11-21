@@ -21,17 +21,43 @@ export default function (pi) {
       },
     ],
     streamSimple(model, context) {
-      const toolCall = {
-        type: "toolCall",
-        id: "test-bg-run",
-        name: "bg_run",
-        arguments: {
-          name: "Fixture build",
-          command:
-            "printf 'fixture live marker\\n'; while [[ ! -f proceed ]]; do sleep 0.02; done; printf 'fixture output\\n'",
-          timeoutSeconds: 8,
-        },
-      };
+      const promptText = JSON.stringify(context.messages);
+      const isDag = promptText.includes("Run the fixture DAG");
+      const toolCall = isDag
+        ? {
+            type: "toolCall",
+            id: "test-bg-run-dag",
+            name: "bg_run_dag",
+            arguments: {
+              tasks: [
+                {
+                  key: "step1",
+                  name: "DAG step 1",
+                  command: "echo step1 >> dag.log; exit 3",
+                  notifyOnCompletion: false,
+                  timeoutSeconds: 8,
+                },
+                {
+                  key: "step2",
+                  name: "DAG step 2",
+                  command: "echo step2 >> dag.log",
+                  after: ["step1"],
+                  timeoutSeconds: 8,
+                },
+              ],
+            },
+          }
+        : {
+            type: "toolCall",
+            id: "test-bg-run",
+            name: "bg_run",
+            arguments: {
+              name: "Fixture build",
+              command:
+                "printf 'fixture live marker\\n'; while [[ ! -f proceed ]]; do sleep 0.02; done; printf 'fixture output\\n'",
+              timeoutSeconds: 8,
+            },
+          };
       const isFirst = ++requests === 1;
       const notification = context.messages.some(
         (message) =>
