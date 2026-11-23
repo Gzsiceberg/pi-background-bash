@@ -1,4 +1,4 @@
-import type { KeybindingsManager, Theme, ThemeBg } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, type KeybindingsManager, type Theme, type ThemeBg } from "@earendil-works/pi-coding-agent";
 import {
   type Component,
   matchesKey,
@@ -16,11 +16,15 @@ import { formatDuration } from "./task-presentation.ts";
 const TAIL_BYTES = 128 * 1024;
 const TAIL_LINES = 2000;
 const MAX_JOB_ROWS = 5;
+const MAX_COMMAND_ROWS = 6;
+const MIN_PREVIEW_ROWS = 2;
+const COPY_NOTICE_MS = 2000;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸"] as const;
 
 export interface PanelTask {
   id: string;
   name: string;
+  command?: string;
   outputPath: string;
   status: "queued" | "running" | "completed" | "failed" | "killed";
   queuedAt?: string;
@@ -120,6 +124,31 @@ function emptyPanel(rows: number, theme: PanelTheme): BodyRow[] {
   return body;
 }
 
+function wrapCommandLines(command: string, textWidth: number, maxRows: number): { lines: string[]; overflow?: string } {
+  const normalized = command.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replace(/\n+$/, "");
+  const wrapped: string[] = [];
+  for (const rawLine of normalized.split("\n")) {
+    const pieces = wrapTextWithAnsi(plainText(rawLine), textWidth);
+    if (pieces.length > 0) {
+      wrapped.push(...pieces);
+    } else {
+      wrapped.push("");
+    }
+  }
+  if (wrapped.length <= maxRows) {
+    return { lines: wrapped };
+  }
+  if (maxRows === 1) {
+    const first = wrapped[0];
+    const clipped = visibleWidth(first) >= textWidth ? truncateToWidth(first, textWidth, "…") : `${first}…`;
+    return { lines: [clipped] };
+  }
+  const shown = wrapped.slice(0, maxRows - 1);
+  const hidden = wrapped.length - shown.length;
+  const noun = hidden === 1 ? "line" : "lines";
+  return { lines: shown, overflow: `… (${hidden} more ${noun})` };
+}
+
 async function loadTail(path: string): Promise<LogTail> {
   try {
     return await readLogTail(path, TAIL_BYTES, TAIL_LINES);
@@ -138,11 +167,15 @@ class TaskPanel implements Component {
   private confirmId?: string;
   private readonly stopping = new Set<string>();
   private stopError?: { id: string; message: string };
+  private copyNotice?: { id: string; ok: boolean; text: string };
+  private copyNoticeTimer?: NodeJS.Timeout;
+  private copySeq = 0;
   private scrollBack?: number;
   private previewRows = 12;
+  private expanded = false;
   private pathOffset?: number;
   private pathPage = { size: 1, lastStart: 0 };
-  private jobRowLayout: { startY: number; ids: string[] } = { startY: 0, ids: [] };
+  private jobRowLayout: { startY: number; ids: (string | undefined)[] } = { startY: 0, ids: [] };
   private spinnerFrame = 0;
   private readonly timer: NodeJS.Timeout;
   private readonly tui: PanelTui;
@@ -151,6 +184,7 @@ class TaskPanel implements Component {
   private readonly getTasks: () => PanelTask[];
   private readonly stopTask: (id: string) => Promise<void>;
   private readonly theme: PanelTheme;
+  private readonly copyText: (text: string) => Promise<void>;
 
   constructor(
     tui: PanelTui,
@@ -160,6 +194,7 @@ class TaskPanel implements Component {
     stopTask: (id: string) => Promise<void>,
     initialId?: string,
     theme: PanelTheme = plainTheme,
+    copyText: (text: string) => Promise<void> = copyToClipboard,
   ) {
     this.tui = tui;
     this.keys = keys;
@@ -168,6 +203,7 @@ class TaskPanel implements Component {
     this.stopTask = stopTask;
     this.selectedId = initialId;
     this.theme = theme;
+    this.copyText = copyText;
     this.timer = setInterval(() => void this.refresh(), LOG_REFRESH_MS);
     this.timer.unref();
     void this.refresh();
@@ -181,8 +217,48 @@ class TaskPanel implements Component {
     this.selectedId = id;
     this.loaded = undefined;
     this.scrollBack = undefined;
+    this.expanded = false;
     this.pathOffset = undefined;
     this.confirmId = undefined;
+    this.clearCopyNotice();
+  }
+
+  private clearCopyNotice() {
+    clearTimeout(this.copyNoticeTimer);
+    this.copyNoticeTimer = undefined;
+    this.copyNotice = undefined;
+  }
+
+  private showCopyNotice(id: string, ok: boolean, text: string) {
+    clearTimeout(this.copyNoticeTimer);
+    this.copyNotice = { id, ok, text };
+    this.copyNoticeTimer = setTimeout(() => {
+      if (!this.disposed && this.copyNotice?.id === id) {
+        this.clearCopyNotice();
+        this.tui.requestRender();
+      }
+    }, COPY_NOTICE_MS);
+    this.copyNoticeTimer.unref();
+    this.tui.requestRender();
+  }
+
+  private async copySelectedCommand(task: PanelTask) {
+    const command = task.command;
+    if (!command?.trim()) {
+      return;
+    }
+    const seq = ++this.copySeq;
+    try {
+      await this.copyText(command);
+      if (!this.disposed && this.copySeq === seq && this.current()?.id === task.id) {
+        this.showCopyNotice(task.id, true, "Copied command");
+      }
+    } catch (error) {
+      if (!this.disposed && this.copySeq === seq && this.current()?.id === task.id) {
+        const reason = error instanceof Error ? error.message : String(error);
+        this.showCopyNotice(task.id, false, `Copy failed: ${plainText(reason)}`);
+      }
+    }
   }
 
   private updateTasks() {
@@ -197,6 +273,9 @@ class TaskPanel implements Component {
     }
     if (!isStoppableStatus(this.current()?.status)) {
       this.confirmId = undefined;
+    }
+    if (!this.canExpand(this.current())) {
+      this.expanded = false;
     }
     this.tui.requestRender();
   }
@@ -356,6 +435,10 @@ class TaskPanel implements Component {
     return isStoppableStatus(task.status) && !this.stopping.has(task.id);
   }
 
+  private canExpand(task?: PanelTask) {
+    return Boolean(task?.command?.trim());
+  }
+
   private statusGlyph(job: PanelTask): string {
     if (job.status === "running") {
       return this.stopping.has(job.id)
@@ -415,27 +498,57 @@ class TaskPanel implements Component {
     return parts.join(this.theme.fg("dim", " · "));
   }
 
-  private jobRows(task: PanelTask, rows: number, width: number, startY: number): BodyRow[] {
+  private formatJobRow(job: PanelTask, selected: boolean, expanded: boolean, width: number): BodyRow {
+    const marker = expanded ? "▾" : "›";
+    const pointer = selected ? this.theme.fg("accent", marker) : " ";
+    const glyph = this.statusGlyph(job);
+    const rawName = plainText(job.name);
+    const nameColor = selected || job.status === "running" ? "text" : "muted";
+    const name = selected ? this.theme.bold(this.theme.fg("text", rawName)) : this.theme.fg(nameColor, rawName);
+    const left = `${pointer} ${glyph} ${name}`;
+    const text = splitRow(left, this.jobMeta(job), width);
+    return lineRow(text, selected ? "selectedBg" : undefined);
+  }
+
+  private commandRows(task: PanelTask, width: number, maxRows: number): BodyRow[] {
+    if (!this.expanded || !task.command?.trim() || maxRows <= 0) {
+      return [];
+    }
+    const useIndent = width >= 6;
+    const textWidth = useIndent ? width - 4 : Math.max(1, width);
+    const { lines, overflow } = wrapCommandLines(task.command, textWidth, maxRows);
+    const indent = useIndent ? "    " : "";
+    const rows = lines.map((line) => lineRow(`${indent}${this.theme.fg("toolOutput", line)}`, "selectedBg"));
+    if (overflow) {
+      rows.push(lineRow(`${indent}${this.theme.fg("dim", overflow)}`, "selectedBg"));
+    }
+    return rows;
+  }
+
+  private jobRows(task: PanelTask, rows: number, width: number, startY: number, reservedRows: number): BodyRow[] {
     if (rows <= 1) {
       this.jobRowLayout = { startY, ids: [] };
       return [];
     }
     const count = Math.min(this.tasks.length, MAX_JOB_ROWS, Math.max(1, Math.floor((rows - 4) / 2)));
+    const maxCommandRows = Math.min(MAX_COMMAND_ROWS, Math.max(0, rows - count - reservedRows));
     const index = this.tasks.indexOf(task);
     const first = Math.min(Math.max(0, index - Math.floor(count / 2)), this.tasks.length - count);
     const visible = this.tasks.slice(first, first + count);
-    this.jobRowLayout = { startY, ids: visible.map((job) => job.id) };
-    return visible.map((job) => {
+    const result: BodyRow[] = [];
+    const layoutIds: (string | undefined)[] = [];
+    for (const job of visible) {
       const selected = job === task;
-      const pointer = selected ? this.theme.fg("accent", "›") : " ";
-      const glyph = this.statusGlyph(job);
-      const rawName = plainText(job.name);
-      const nameColor = selected || job.status === "running" ? "text" : "muted";
-      const name = selected ? this.theme.bold(this.theme.fg("text", rawName)) : this.theme.fg(nameColor, rawName);
-      const left = `${pointer} ${glyph} ${name}`;
-      const text = splitRow(left, this.jobMeta(job), width);
-      return lineRow(text, selected ? "selectedBg" : undefined);
-    });
+      const expandedRows = selected ? this.commandRows(job, width, maxCommandRows) : [];
+      result.push(this.formatJobRow(job, selected, expandedRows.length > 0, width));
+      layoutIds.push(job.id);
+      for (const cmdRow of expandedRows) {
+        result.push(cmdRow);
+        layoutIds.push(undefined);
+      }
+    }
+    this.jobRowLayout = { startY, ids: layoutIds };
+    return result;
   }
 
   private warning(task: PanelTask) {
@@ -450,11 +563,12 @@ class TaskPanel implements Component {
   private renderJob(task: PanelTask, rows: number, width: number, startY: number): BodyRow[] {
     const showDividers = rows >= 7;
     const footerRows = showDividers ? 2 : 1;
-    const body = this.jobRows(task, rows, width, startY);
+    const warning = this.warning(task);
+    const reservedRows = (showDividers ? 1 : 0) + footerRows + (warning ? 1 : 0) + MIN_PREVIEW_ROWS;
+    const body = this.jobRows(task, rows, width, startY, reservedRows);
     if (showDividers && body.length > 0) {
       body.push({ kind: "divider" });
     }
-    const warning = this.warning(task);
     if (warning && rows - body.length - footerRows >= 3) {
       body.push(lineRow(this.theme.fg("error", plainText(warning))));
     }
@@ -473,9 +587,18 @@ class TaskPanel implements Component {
       const cancel = formatHint(this.theme, "Esc/n", "cancel");
       return `${prompt}  ${joinHints(this.theme, [confirm, cancel])}`;
     }
+    if (this.copyNotice?.id === task.id) {
+      return this.copyNotice.ok
+        ? this.theme.fg("success", `✓ ${this.copyNotice.text}`)
+        : this.theme.fg("error", this.copyNotice.text);
+    }
     const hints = [formatHint(this.theme, "Esc", "close")];
     if (this.tasks.length > 1) {
       hints.push(formatHint(this.theme, "↑/↓", "jobs"));
+    }
+    if (this.canExpand(task)) {
+      hints.push(formatHint(this.theme, "Enter", this.expanded ? "hide" : "command"));
+      hints.push(formatHint(this.theme, "y", "copy"));
     }
     if (this.canStop(task)) {
       hints.push(formatHint(this.theme, "x", "stop"));
@@ -575,6 +698,7 @@ class TaskPanel implements Component {
     }
     const task = this.current();
     if (task && this.handleJobInput(data, task)) {
+      this.clearCopyNotice();
       this.redraw();
     }
   }
@@ -611,7 +735,13 @@ class TaskPanel implements Component {
   }
 
   private handleJobInput(data: string, task: PanelTask) {
-    if (matchesKey(data, "x") && this.canStop(task)) {
+    if (matchesKey(data, "y") && this.canExpand(task)) {
+      void this.copySelectedCommand(task);
+      return false;
+    }
+    if ((matchesKey(data, "enter") || this.keys.matches(data, "tui.select.confirm")) && this.canExpand(task)) {
+      this.expanded = !this.expanded;
+    } else if (matchesKey(data, "x") && this.canStop(task)) {
       this.confirmId = task.id;
     } else if (matchesKey(data, "p")) {
       this.pathOffset = 0;
@@ -707,9 +837,9 @@ class TaskPanel implements Component {
 
   private switchJob(data: string, task: PanelTask) {
     let offset = 0;
-    if (this.keys.matches(data, "tui.select.up")) {
+    if (this.keys.matches(data, "tui.select.up") || matchesKey(data, "k")) {
       offset = -1;
-    } else if (this.keys.matches(data, "tui.select.down")) {
+    } else if (this.keys.matches(data, "tui.select.down") || matchesKey(data, "j")) {
       offset = 1;
     }
     if (offset === 0 || this.tasks.length < 2) {
@@ -727,6 +857,7 @@ class TaskPanel implements Component {
   dispose() {
     this.disposed = true;
     clearInterval(this.timer);
+    this.clearCopyNotice();
   }
 }
 
@@ -738,6 +869,7 @@ export function createTaskPanel(
   stopTask: (id: string) => Promise<void>,
   initialId?: string,
   theme?: PanelTheme,
+  copyText?: (text: string) => Promise<void>,
 ): Component & { dispose(): void } {
-  return new TaskPanel(tui, keys, close, getTasks, stopTask, initialId, theme);
+  return new TaskPanel(tui, keys, close, getTasks, stopTask, initialId, theme, copyText);
 }

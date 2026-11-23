@@ -426,6 +426,160 @@ async function checkQueuedTaskDisplayAndStop(t: TestContext) {
   assert.match(display(), /LIVE/);
 }
 
+async function checkExpandCommand(t: TestContext) {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-bg-expand-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const firstLog = join(cwd, "first.log");
+  const secondLog = join(cwd, "second.log");
+  await writeFile(firstLog, "first output\n");
+  await writeFile(secondLog, "second output\n");
+  const longCommand = [
+    "set -euo pipefail",
+    "echo \x1b[32mstep 1\x1b[0m",
+    "echo step 2",
+    "echo step 3",
+    "echo step 4",
+    "echo step 5",
+    "echo step 6",
+    "echo step 7",
+  ].join("\n");
+  const jobs: PanelTask[] = [
+    { id: "first", name: "Short cmd", command: "npm test -- --watch", outputPath: firstLog, status: "running" },
+    { id: "second", name: "Long cmd", command: longCommand, outputPath: secondLog, status: "completed", exitCode: 0 },
+  ];
+  const terminal = { rows: 24 };
+  const copied: string[] = [];
+  const stopped: string[] = [];
+  let copyFailure: Error | undefined;
+  const keys = {
+    matches(data: string, binding: string) {
+      if (binding === "tui.select.up") {
+        return matchesKey(data, "up");
+      }
+      if (binding === "tui.select.down") {
+        return matchesKey(data, "down");
+      }
+      if (binding === "tui.select.confirm") {
+        return matchesKey(data, "enter");
+      }
+      return false;
+    },
+  };
+  const panel = createTaskPanel(
+    {
+      terminal: terminal as Parameters<typeof createTaskPanel>[0]["terminal"],
+      requestRender() {
+        // Explicit rendering below.
+      },
+    },
+    keys,
+    () => assert.fail("Panel closed"),
+    () => jobs,
+    async (id) => {
+      stopped.push(id);
+      await Promise.resolve();
+    },
+    undefined,
+    undefined,
+    async (text) => {
+      if (copyFailure) {
+        throw copyFailure;
+      }
+      copied.push(text);
+      await Promise.resolve();
+    },
+  );
+  t.after(() => panel.dispose());
+  const display = (width = 80) => panel.render(width).join("\n");
+  await until(() => display().includes("first output"));
+
+  const baseHeight = panel.render(80).length;
+  assert.match(display(), /› [⠋⠙⠹⠸] Short cmd/);
+  assert.doesNotMatch(display(), /npm test -- --watch/);
+  assert.match(display(), /Enter command/);
+  assert.match(display(), /y copy/);
+
+  // Enter expands the selected task inline (4-space indent, no $ prefix) and keeps height and live preview intact.
+  panel.handleInput?.("\r");
+  const expanded = display();
+  assert.equal(panel.render(80).length, baseHeight);
+  assert.match(expanded, /▾ [⠋⠙⠹⠸] Short cmd/);
+  assert.match(expanded, / {4}npm test -- --watch/);
+  assert.doesNotMatch(expanded, /\$ npm test/);
+  assert.match(expanded, /first output/);
+  assert.match(expanded, /Enter hide/);
+
+  // y copies the selected command and shows transient feedback.
+  panel.handleInput?.("y");
+  await until(() => display().includes("Copied command"));
+  assert.deepEqual(copied, ["npm test -- --watch"]);
+  assert.match(display(), /✓ Copied command/);
+
+  // Clicking on the expanded command row (y = 2) returns undefined for drag-selection,
+  // while clicking the shifted second job row (y = 3) selects it, collapses the first, and clears the notice.
+  assert.equal(panel.handleMouse?.(mouseEvent({ type: "press", button: "left", y: 2 })), undefined);
+  const clickSecond = panel.handleMouse?.(mouseEvent({ type: "press", button: "left", y: 3 }));
+  assert.equal(clickSecond?.handled, true);
+  await until(() => display().includes("second output"));
+  assert.match(display(), /› ✓ Long cmd/);
+  assert.doesNotMatch(display(), /npm test -- --watch/);
+  assert.doesNotMatch(display(), /Copied command/);
+  assert.match(display(), /Enter command/);
+
+  // Expanding a long multi-line command strips ANSI, caps rows with overflow note, and preserves height.
+  panel.handleInput?.("\r");
+  const longDisplay = display();
+  assert.equal(panel.render(80).length, baseHeight);
+  assert.match(longDisplay, /▾ ✓ Long cmd/);
+  assert.match(longDisplay, / {4}set -euo pipefail/);
+  assert.match(longDisplay, / {4}echo step 1/);
+  assert.ok(!longDisplay.includes("\x1b"));
+  assert.match(longDisplay, /… \(3 more lines\)/);
+  assert.match(longDisplay, /second output/);
+  assert.ok(panel.render(12).every((line) => visibleWidth(line) <= 12));
+
+  // y copies the full untruncated command even when inline display is clipped.
+  panel.handleInput?.("y");
+  await until(() => display().includes("Copied command"));
+  assert.deepEqual(copied, ["npm test -- --watch", longCommand]);
+
+  // Clipboard failures surface cleanly in the footer.
+  copyFailure = new Error("Clipboard unavailable");
+  panel.handleInput?.("y");
+  await until(() => display().includes("Copy failed: Clipboard unavailable"));
+  copyFailure = undefined;
+
+  // Tiny terminal omits command rows cleanly without overflowing.
+  terminal.rows = 4;
+  assert.ok(panel.render(80).every((line) => visibleWidth(line) <= 80));
+  assert.match(display(), /second output/);
+  terminal.rows = 24;
+
+  // Pressing Enter again collapses the command and clears the notice.
+  panel.handleInput?.("\r");
+  assert.match(display(), /› ✓ Long cmd/);
+  assert.doesNotMatch(display(), /set -euo pipefail/);
+  assert.match(display(), /Enter command/);
+
+  // j and k move between jobs (with wrap-around) and collapse any expanded command.
+  panel.handleInput?.("\r");
+  assert.match(display(), /▾ ✓ Long cmd/);
+  panel.handleInput?.("k");
+  await until(() => display().includes("first output"));
+  assert.match(display(), /› [⠋⠙⠹⠸] Short cmd/);
+  assert.doesNotMatch(display(), /set -euo pipefail/);
+
+  // x followed by y still confirms stopping instead of copying.
+  panel.handleInput?.("x");
+  panel.handleInput?.("y");
+  assert.deepEqual(stopped, ["first"]);
+  assert.equal(copied.length, 2);
+
+  panel.handleInput?.("j");
+  await until(() => display().includes("second output"));
+  assert.match(display(), /› ✓ Long cmd/);
+}
+
 test("task panel marks clipped output and confirms stopping only the selected live job", posix, checkClippingAndStop);
 test("opens a job by ID, freezes scrollback, and shows its full log path", posix, checkScrollbackAndPath);
 test(
@@ -439,3 +593,4 @@ test(
   posix,
   checkQueuedTaskDisplayAndStop,
 );
+test("expands and collapses the selected task command inline with Enter", posix, checkExpandCommand);

@@ -28,6 +28,7 @@ export interface DagNodeOptions extends RunOptions {
 interface TaskBase {
   id: string;
   name: string;
+  command: string;
   description?: string;
   pid: number | undefined;
   cwd: string;
@@ -414,6 +415,7 @@ async function launchTask(
   const base: Omit<TaskBase, "pid" | "startedAt"> = {
     id,
     name,
+    command: options.command,
     cwd,
     description: options.description,
     outputPath: join(directory, "output.log"),

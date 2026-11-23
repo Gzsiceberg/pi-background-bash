@@ -20,13 +20,15 @@ const posix = { skip: process.platform === "win32", timeout: 5000 };
 
 test("returns before the command ends and captures Bash stdout and stderr in the project", posix, async (t) => {
   const { cwd, root, tasks } = await fixture(t);
+  const command =
+    'while [[ ! -f proceed ]]; do sleep 0.02; done; words=(test passed); printf "%s\\n" "${words[*]}"; echo stderr >&2';
   const { task, done } = await tasks.run(cwd, root, {
     name: "Bash syntax test",
-    command:
-      'while [[ ! -f proceed ]]; do sleep 0.02; done; words=(test passed); printf "%s\\n" "${words[*]}"; echo stderr >&2',
+    command,
     timeoutSeconds: 4,
   });
   assert.equal(task.status, "running");
+  assert.equal(task.command, command);
   assert.match(task.id, /^[0-9a-f]{8}$/);
   assert.equal(task.outputPath, join(root, task.id, "output.log"));
   assert.equal(task.resultPath, join(root, task.id, "result.json"));
@@ -36,11 +38,14 @@ test("returns before the command ends and captures Bash stdout and stderr in the
   await writeFile(join(cwd, "proceed"), "");
   const result = await done;
   assert.equal(result.status, "completed");
+  assert.equal(result.command, command);
   assert.equal(result.exitCode, 0);
   const output = await readFile(task.outputPath, "utf8");
   assert.match(output, /test passed\n/);
   assert.match(output, /stderr\n/);
-  assert.equal(JSON.parse(await readFile(task.resultPath, "utf8")).status, "completed");
+  const saved = JSON.parse(await readFile(task.resultPath, "utf8"));
+  assert.equal(saved.status, "completed");
+  assert.equal(saved.command, command);
   assert.equal((await stat(task.outputPath)).mode & 0o777, 0o600);
 });
 
